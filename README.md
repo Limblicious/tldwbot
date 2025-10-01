@@ -1,2 +1,112 @@
-# tldwbot
-Youtube Video Summarizer
+# TL;DW Discord Bot
+
+A production-ready Discord bot that turns any YouTube video into a structured, actionable summary. The bot automatically fetches transcripts (captions, local Whisper, or OpenAI Whisper) and produces multi-section summaries powered by OpenAI's Chat API.
+
+## Features
+
+- `/summarize` slash command accepts a YouTube URL or video ID.
+- Transcript acquisition pipeline with ordered fallbacks:
+  1. YouTube captions via [`youtube-transcript-api`](https://pypi.org/project/youtube-transcript-api/)
+  2. Local Whisper transcription with [`faster-whisper`](https://github.com/guillaumekln/faster-whisper) using `yt-dlp` audio downloads
+  3. OpenAI Whisper (`whisper-1`) when captions/local transcription are unavailable
+- Structured Markdown summaries with TL;DR, key points, timestamped outline, notable quotes, action items, and caveats.
+- Automatic chunking for long transcripts and final merge summarization.
+- SQLite caching for transcripts and summaries with force-refresh support.
+- Custom prompt overrides per request.
+- Discord-safe message splitting with automatic `.txt` attachments for long outputs.
+- Docker-ready deployment with ffmpeg and all dependencies.
+
+## Project Layout
+
+```
+bot/
+├── __init__.py
+├── main.py           # Discord bot + slash command orchestration
+├── storage.py        # Thread-safe SQLite cache wrapper
+├── summarize.py      # Transcript chunking & OpenAI-powered summarization
+└── transcripts.py    # Transcript acquisition pipeline & fallbacks
+requirements.txt
+Dockerfile
+.env.example
+README.md
+```
+
+## Prerequisites
+
+- Python 3.11+
+- ffmpeg (required for audio extraction/transcoding)
+- Discord bot token with the `applications.commands` scope enabled
+- OpenAI API key with access to `gpt-4.1-mini` and `whisper-1`
+
+## Configuration
+
+Copy the example environment file and fill in the required values:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Description |
+| --- | --- |
+| `DISCORD_BOT_TOKEN` | Discord bot token |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `OPENAI_SUMMARY_MODEL` | Chat model for summarization (default `gpt-4.1-mini`) |
+| `USE_LOCAL_WHISPER` | `true`/`false` – enable local Whisper fallback |
+| `WHISPER_MODEL_SIZE` | Faster-Whisper model size (e.g. `small`, `medium`) |
+| `CACHE_DB` | SQLite database path (default `cache.sqlite3`) |
+| `MAX_CHARS_PER_CHUNK` | Max characters per transcript chunk before summarization |
+| `MAX_DISCORD_MSG_CHARS` | Max characters per Discord message chunk (≤ 1900 recommended) |
+
+## Local Development
+
+1. Install dependencies:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+2. Ensure ffmpeg is installed and on your `PATH`.
+3. Create `.env` using the template and populate required values.
+4. Run the bot:
+   ```bash
+   python -m bot.main
+   ```
+5. Invite the bot to your server with the `applications.commands` scope and use `/summarize`.
+
+### Forcing Refresh & Prompt Overrides
+
+- `force_refresh`: `/summarize url:<video> force_refresh:true`
+- `prompt_override`: `/summarize url:<video> prompt_override:"Your custom instructions"`
+
+## Docker Deployment
+
+Build and run the container:
+
+```bash
+docker build -t tldw-bot .
+docker run --env-file .env tldw-bot
+```
+
+Mount a volume for persistent caching if desired:
+
+```bash
+docker run \
+  --env-file .env \
+  -v $(pwd)/cache.sqlite3:/app/cache.sqlite3 \
+  tldw-bot
+```
+
+## SQLite Cache Schema
+
+- **transcripts**: `video_id`, `source`, `text`, `created_at`
+- **summaries**: `video_id`, `prompt_hash`, `model`, `summary`, `created_at`
+
+Use `/summarize force_refresh:true` to bypass cached entries.
+
+## Notes
+
+- Local Whisper requires significant resources. Adjust `WHISPER_MODEL_SIZE` or disable with `USE_LOCAL_WHISPER=false` for lighter deployments.
+- The bot automatically labels the transcript source in responses.
+- Large summaries are attached as `.txt` files for convenience.
+- Ensure your Discord bot has the `Message Content Intent` if you plan to extend functionality beyond slash commands.
+
