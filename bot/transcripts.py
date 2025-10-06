@@ -94,10 +94,22 @@ def fetch_transcript(url: str) -> Optional[str]:
         except subprocess.TimeoutExpired:
             return None
 
-        # Check for rate limiting in stderr
-        if result.stderr and ("429" in result.stderr or "Too Many Requests" in result.stderr):
-            logger.warning("Rate limit detected in yt-dlp output for %s", url)
-            raise TranscriptError("YouTube is temporarily rate limiting requests. Please try again in a few minutes.")
+        # Only consider rate limiting if yt-dlp FAILED and explicitly logged 429/Too Many Requests
+        if result.returncode != 0:
+            if result.stderr and (" 429" in result.stderr or "Too Many Requests" in result.stderr):
+                logger.warning(
+                    "yt-dlp nonzero exit with 429/Too Many Requests for %s; will try fallbacks",
+                    url,
+                )
+                return None
+            # Nonzero without clear 429: log and fall back
+            logger.debug(
+                "yt-dlp failed for %s (rc=%s, stderr=%r)",
+                url,
+                result.returncode,
+                result.stderr,
+            )
+            return None
 
         if result.returncode == 0 and result.stdout:
             text = parse_vtt(result.stdout)
@@ -149,8 +161,11 @@ def fetch_transcript(url: str) -> Optional[str]:
 
                             # Check for rate limiting
                             if r.status_code == 429:
-                                logger.warning("Rate limit hit when fetching VTT for %s", url)
-                                raise TranscriptError("YouTube is temporarily rate limiting requests. Please try again in a few minutes.")
+                                logger.warning(
+                                    "HTTP 429 when fetching subtitles for %s (direct URL); will try other fallbacks",
+                                    url,
+                                )
+                                return None
 
                             r.raise_for_status()
                             content = r.text
@@ -168,8 +183,11 @@ def fetch_transcript(url: str) -> Optional[str]:
 
                                         # Check for rate limiting again
                                         if r.status_code == 429:
-                                            logger.warning("Rate limit hit when fetching VTT (2nd attempt) for %s", url)
-                                            raise TranscriptError("YouTube is temporarily rate limiting requests. Please try again in a few minutes.")
+                                            logger.warning(
+                                                "HTTP 429 when fetching subtitles for %s (direct URL); will try other fallbacks",
+                                                url,
+                                            )
+                                            return None
 
                                         r.raise_for_status()
                                         content = r.text
@@ -333,5 +351,10 @@ def obtain_transcript(
         return captions
 
     # No captions available
-    logger.error("No captions available for video %s", video_id)
-    raise TranscriptError("No captions available for this video.")
+    logger.error(
+        "No captions available for video %s after trying youtube-transcript-api, yt-dlp stdout, and direct-URL fallback",
+        video_id,
+    )
+    raise TranscriptError(
+        "No captions available right now. (Not a rate limit; no usable caption track was found.)"
+    )
