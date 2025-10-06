@@ -94,6 +94,11 @@ def fetch_transcript(url: str) -> Optional[str]:
         except subprocess.TimeoutExpired:
             return None
 
+        # Check for rate limiting in stderr
+        if result.stderr and ("429" in result.stderr or "Too Many Requests" in result.stderr):
+            logger.warning("Rate limit detected in yt-dlp output for %s", url)
+            raise TranscriptError("YouTube is temporarily rate limiting requests. Please try again in a few minutes.")
+
         if result.returncode == 0 and result.stdout:
             text = parse_vtt(result.stdout)
             return text.strip() or None
@@ -141,6 +146,12 @@ def fetch_transcript(url: str) -> Optional[str]:
                             if "/api/timedtext" in vtt_url and "fmt=" not in vtt_url:
                                 vtt_url = vtt_url + "&fmt=vtt"
                             r = requests.get(vtt_url, timeout=30)
+
+                            # Check for rate limiting
+                            if r.status_code == 429:
+                                logger.warning("Rate limit hit when fetching VTT for %s", url)
+                                raise TranscriptError("YouTube is temporarily rate limiting requests. Please try again in a few minutes.")
+
                             r.raise_for_status()
                             content = r.text
                             # If we got M3U8 playlist, try to force VTT format
@@ -154,6 +165,12 @@ def fetch_transcript(url: str) -> Optional[str]:
                                         else:
                                             vtt_url = line.strip() + "&fmt=vtt"
                                         r = requests.get(vtt_url, timeout=30)
+
+                                        # Check for rate limiting again
+                                        if r.status_code == 429:
+                                            logger.warning("Rate limit hit when fetching VTT (2nd attempt) for %s", url)
+                                            raise TranscriptError("YouTube is temporarily rate limiting requests. Please try again in a few minutes.")
+
                                         r.raise_for_status()
                                         content = r.text
                                         break
@@ -161,7 +178,11 @@ def fetch_transcript(url: str) -> Optional[str]:
                             if text:
                                 return text
             return None
-        except Exception:
+        except TranscriptError:
+            # Re-raise TranscriptError so it propagates up
+            raise
+        except Exception as e:
+            logger.debug("Direct URL fallback failed: %s", str(e)[:100])
             return None
 
     # Try MANUAL subs first
@@ -268,9 +289,14 @@ def fetch_captions(video_id: str) -> Optional[TranscriptResult]:
 
     except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
         pass
-    except Exception:
+    except Exception as e:
+        # Check for rate limiting
+        error_str = str(e).lower()
+        if "429" in error_str or "too many requests" in error_str:
+            logger.error("YouTube rate limit hit for video %s: %s", video_id, str(e)[:200])
+            raise TranscriptError("YouTube is temporarily rate limiting requests. Please try again in a few minutes.")
         # Network, cookie, or other transient issues – fall through to yt-dlp path
-        pass
+        logger.debug("youtube-transcript-api failed for %s, trying yt-dlp: %s", video_id, str(e)[:100])
 
     # --- Secondary: yt-dlp subprocess path (fixed flags) ---
     text = fetch_transcript(url)
