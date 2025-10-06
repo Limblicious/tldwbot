@@ -123,7 +123,7 @@ def transcribe_with_local_whisper(video_id: str, model_size: str) -> Optional[Tr
                 "nocheckcertificate": True,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_id, download=True)
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
                 downloaded_path = ydl.prepare_filename(info)
             audio_path = _ensure_audio_extension(downloaded_path)
             model = _load_whisper_model(model_size)
@@ -171,7 +171,7 @@ def transcribe_with_openai_whisper(
                 "nocheckcertificate": True,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_id, download=True)
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
                 downloaded_path = ydl.prepare_filename(info)
             audio_path = _ensure_audio_extension(downloaded_path)
             with open(audio_path, "rb") as file_stream:

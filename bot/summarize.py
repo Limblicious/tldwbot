@@ -54,17 +54,18 @@ def chunk_transcript(text: str, max_chars: int) -> List[str]:
 
 
 def call_openai_summary(prompt: str, client: OpenAI, model: str) -> str:
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model,
-        input=[
+        messages=[
             {
                 "role": "system",
                 "content": "You are a helpful assistant that strictly follows formatting instructions.",
             },
             {"role": "user", "content": prompt},
         ],
+        temperature=0.2,
     )
-    return response.output_text.strip()
+    return response.choices[0].message.content.strip()
 
 
 def summarize_chunk(
