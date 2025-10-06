@@ -1,10 +1,14 @@
 """Discord bot entrypoint."""
 from __future__ import annotations
 
+import certifi
+import os
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+
 import asyncio
 import io
 import logging
-import os
 from typing import Optional
 
 import discord

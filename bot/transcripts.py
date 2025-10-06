@@ -2,28 +2,12 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
-import tempfile
+import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
-from youtube_transcript_api import (
-    NoTranscriptFound,
-    TranscriptsDisabled,
-    YouTubeTranscriptApi,
-)
-
 from .storage import Storage
-
-try:
-    from faster_whisper import WhisperModel
-except Exception:  # pragma: no cover - optional dependency during CI
-    WhisperModel = None  # type: ignore
-
-import yt_dlp
-from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -71,120 +55,104 @@ def get_cached_transcript(
     return None
 
 
-def fetch_captions(video_id: str) -> Optional[TranscriptResult]:
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript = None
-        try:
-            transcript = transcript_list.find_transcript(["en", "en-US", "en-GB"])
-        except NoTranscriptFound:
-            pass
-        if transcript is None:
-            for candidate in transcript_list:
-                transcript = candidate
-                if getattr(candidate, "language_code", "").startswith("en"):
-                    break
-        if transcript is None:
-            raise NoTranscriptFound("No transcripts available")
-        data = transcript.fetch()
-        text = "\n".join(item.get("text", "").strip() for item in data if item.get("text"))
-        language = getattr(transcript, "language", None) or getattr(transcript, "language_code", None)
-        logger.info("Fetched captions for %s", video_id)
-        return TranscriptResult(text=text, source="captions", language=language)
-    except (TranscriptsDisabled, NoTranscriptFound) as exc:
-        logger.warning("Captions unavailable for %s: %s", video_id, exc)
-        return None
-    except Exception as exc:  # pragma: no cover - upstream errors
-        logger.error("Failed to download captions for %s: %s", video_id, exc)
-        return None
+def parse_vtt(vtt_content: str) -> str:
+    """Parse VTT subtitle format and extract plain text."""
+    lines = []
+    for line in vtt_content.split('\n'):
+        line = line.strip()
+        # Skip WEBVTT header, timestamp lines, and empty lines
+        if not line or line.startswith('WEBVTT') or '-->' in line or line.isdigit():
+            continue
+        # Skip metadata lines
+        if line.startswith('Kind:') or line.startswith('Language:'):
+            continue
+        lines.append(line)
+    return '\n'.join(lines)
 
 
-_LOCAL_WHISPER_CACHE: dict[str, WhisperModel] = {}
+def fetch_transcript(url: str) -> Optional[str]:
+    """
+    Fetch transcript using yt-dlp subprocess.
 
-
-def _load_whisper_model(size: str) -> WhisperModel:
-    if WhisperModel is None:
-        raise RuntimeError("faster-whisper is not installed")
-    if size not in _LOCAL_WHISPER_CACHE:
-        logger.info("Loading faster-whisper model %s", size)
-        _LOCAL_WHISPER_CACHE[size] = WhisperModel(size)
-    return _LOCAL_WHISPER_CACHE[size]
-
-
-def transcribe_with_local_whisper(video_id: str, model_size: str) -> Optional[TranscriptResult]:
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_template = os.path.join(tmpdir, "audio.%(ext)s")
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": output_template,
-                "quiet": True,
-                "noplaylist": True,
-                "nocheckcertificate": True,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-                downloaded_path = ydl.prepare_filename(info)
-            audio_path = _ensure_audio_extension(downloaded_path)
-            model = _load_whisper_model(model_size)
-            segments, _ = model.transcribe(audio_path)
-            lines = []
-            for segment in segments:
-                if segment.text:
-                    lines.append(segment.text.strip())
-            text = "\n".join(lines)
-            logger.info("Local whisper transcription complete for %s", video_id)
-            return TranscriptResult(text=text, source="local_whisper")
-    except Exception as exc:
-        logger.error("Local whisper transcription failed for %s: %s", video_id, exc)
-        return None
-
-
-def _ensure_audio_extension(path: str) -> str:
-    # If yt-dlp downloads a video container, convert to wav via ffmpeg
-    ext = Path(path).suffix.lower()
-    if ext in {".wav", ".mp3", ".m4a", ".opus"}:
-        return path
-    converted = f"{Path(path).with_suffix('.wav')}"
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        path,
-        converted,
+    First tries manual subtitles, then auto-generated subtitles.
+    Returns plain text or None if no subtitles available.
+    """
+    # Try manual subtitles first
+    cmd = [
+        'yt-dlp',
+        '--skip-download',
+        '--write-subs',
+        '--sub-lang', 'en',
+        '--sub-format', 'vtt',
+        '-o', '-',
+        url
     ]
-    os.system(" ".join(command))
-    return converted if Path(converted).exists() else path
 
-
-def transcribe_with_openai_whisper(
-    video_id: str, client: OpenAI
-) -> Optional[TranscriptResult]:
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_template = os.path.join(tmpdir, "audio.%(ext)s")
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": output_template,
-                "quiet": True,
-                "noplaylist": True,
-                "nocheckcertificate": True,
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-                downloaded_path = ydl.prepare_filename(info)
-            audio_path = _ensure_audio_extension(downloaded_path)
-            with open(audio_path, "rb") as file_stream:
-                response = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=file_stream,
-                )
-            text = response.text
-            logger.info("Cloud whisper transcription complete for %s", video_id)
-            return TranscriptResult(text=text, source="cloud_whisper")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0 and result.stdout:
+            text = parse_vtt(result.stdout)
+            if text.strip():
+                logger.info("Fetched manual subtitles for %s", url)
+                return text
+
+        # Check if stderr indicates no subtitles
+        if 'no subtitles' in result.stderr.lower():
+            logger.info("No manual subtitles, trying auto-generated for %s", url)
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout fetching manual subtitles for %s", url)
     except Exception as exc:
-        logger.error("OpenAI whisper transcription failed for %s: %s", video_id, exc)
-        return None
+        logger.error("Error fetching manual subtitles for %s: %s", url, exc)
+
+    # Try auto-generated subtitles
+    cmd_auto = [
+        'yt-dlp',
+        '--skip-download',
+        '--write-auto-sub',
+        '--sub-lang', 'en',
+        '--sub-format', 'vtt',
+        '-o', '-',
+        url
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd_auto,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0 and result.stdout:
+            text = parse_vtt(result.stdout)
+            if text.strip():
+                logger.info("Fetched auto-generated subtitles for %s", url)
+                return text
+
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout fetching auto-generated subtitles for %s", url)
+    except Exception as exc:
+        logger.error("Error fetching auto-generated subtitles for %s: %s", url, exc)
+
+    return None
+
+
+def fetch_captions(video_id: str) -> Optional[TranscriptResult]:
+    """Fetch captions using yt-dlp subprocess."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    text = fetch_transcript(url)
+
+    if text:
+        return TranscriptResult(text=text, source="yt-dlp", language="en")
+
+    logger.error("No captions available for video %s", video_id)
+    return None
 
 
 def obtain_transcript(
@@ -192,34 +160,26 @@ def obtain_transcript(
     video_id: str,
     *,
     force_refresh: bool,
-    use_local_whisper: bool,
-    whisper_model_size: str,
-    openai_client: Optional[OpenAI],
+    use_local_whisper: bool = False,
+    whisper_model_size: str = "",
+    openai_client: Optional[object] = None,
 ) -> TranscriptResult:
+    """
+    Obtain transcript for a YouTube video.
+
+    Only fetches captions via yt-dlp subprocess. Does not fall back to Whisper.
+    Raises TranscriptError if captions are unavailable.
+    """
     cached = get_cached_transcript(storage, video_id, force_refresh)
     if cached:
         return cached
 
-    # Captions first
+    # Fetch captions only - no Whisper fallback
     captions = fetch_captions(video_id)
     if captions:
         storage.upsert_transcript(video_id, captions.source, captions.text)
         return captions
 
-    # Local whisper fallback
-    if use_local_whisper:
-        whisper_result = transcribe_with_local_whisper(video_id, whisper_model_size)
-        if whisper_result:
-            storage.upsert_transcript(video_id, whisper_result.source, whisper_result.text)
-            return whisper_result
-
-    # Cloud whisper fallback
-    if openai_client is None:
-        raise TranscriptError("OpenAI client unavailable for whisper fallback")
-    cloud_result = transcribe_with_openai_whisper(video_id, openai_client)
-    if cloud_result:
-        storage.upsert_transcript(video_id, cloud_result.source, cloud_result.text)
-        return cloud_result
-
-    raise TranscriptError("Unable to retrieve transcript")
-
+    # No captions available
+    logger.error("No captions available for video %s", video_id)
+    raise TranscriptError("No captions available for this video.")

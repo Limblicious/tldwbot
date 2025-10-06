@@ -26,6 +26,14 @@ This file contains strict guidelines for future edits to the tldwbot codebase.
 - **Never** pass just the video ID directly to `ydl.extract_info()`
 - This ensures proper metadata extraction and compatibility
 
+## Transcripts
+
+- **Only** fetch captions via youtube-transcript-api (which uses yt-dlp internally)
+- **Never** fall back to Whisper (local or cloud) for transcription
+- If captions are unavailable, return a clear error message: "No captions available for this video."
+- **Do not** download audio or video files for transcription purposes
+- This keeps the bot fast and prevents it from hanging on long videos
+
 ## Discord Interaction Patterns
 
 - Ephemeral behavior must be **consistent** across all interactions
@@ -47,10 +55,9 @@ This file contains strict guidelines for future edits to the tldwbot codebase.
 
 ## Dockerfile Constraints
 
-- **Do not** reintroduce `apt-get install` of ffmpeg into the Dockerfile
-- On Omarchy, Docker build cannot access apt repos due to missing veth modules
-- If local transcription is required, install ffmpeg on the host OS or prebuild the image on another machine
-- Keep the Dockerfile minimal with only Python dependencies from pip
+- ffmpeg is installed for audio format conversion (required by youtube-transcript-api fallbacks)
+- On Omarchy, apt packages must be carefully managed due to networking constraints
+- Keep the Dockerfile minimal with only essential system and Python dependencies
 
 ## Code Integrity
 
@@ -65,6 +72,13 @@ This file contains strict guidelines for future edits to the tldwbot codebase.
 - Test changes locally before committing
 - Follow existing code style and patterns
 - Maintain backward compatibility unless explicitly breaking changes are required
+
+## Transcript Extraction Rules
+
+- Always use yt-dlp with `--write-subs` first, then retry with `--write-auto-sub`.
+- Parse `.vtt` directly from stdout instead of saving temp files.
+- Do not use Whisper fallback in this project.
+- Always keep yt-dlp upgraded to the latest version in Dockerfile.
 
 ---
 
