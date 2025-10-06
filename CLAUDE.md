@@ -8,6 +8,17 @@ This file contains strict guidelines for future edits to the tldwbot codebase.
 - **Never** use `client.responses.create()` or other deprecated/incorrect API methods
 - Maintain `temperature=0.2` for consistent summarization results
 - **Do not** pass `proxies` into the OpenAI client constructor. The current OpenAI Python SDK rejects `proxies=` as an argument. If proxy support is required, use environment variables (`HTTP_PROXY`, `HTTPS_PROXY`) instead.
+- **Always** use `from openai import OpenAI` and instantiate with `OpenAI(api_key=...)`.
+- **Never** use `Client(...)` or pass `proxies=` into the constructor.
+- If proxy support is required in the future, use environment variables `HTTP_PROXY`/`HTTPS_PROXY`.
+
+## Dockerfile Guardrail
+
+- Always include a forced reinstall of the `openai==1.12.0` and `httpx==0.26.0` SDK in the Dockerfile build step.
+- Do **not** remove the `&& pip install --upgrade --force-reinstall openai==1.12.0 httpx==0.26.0` line.
+- This prevents dependency drift where transitive requirements downgrade or upgrade OpenAI/httpx to versions that reintroduce the `proxies` bug.
+- The `httpx==0.26.0` pin is required because newer httpx versions (0.28+) changed the `Client.__init__()` signature and reject the `proxies` argument.
+- If upgrading OpenAI or httpx in the future, update this guardrail and verify bot startup succeeds before removing or changing this line.
 
 ## YouTube Video Processing
 
