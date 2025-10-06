@@ -66,11 +66,12 @@ async def summarize_command(
     prompt_override: Optional[str],
     bot: SummaryBot,
 ) -> None:
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
     video_id = extract_video_id(url)
     if not video_id:
         await interaction.followup.send(
             "❌ Unable to determine YouTube video ID. Please provide a valid URL or ID.",
+            ephemeral=True,
         )
         return
 
@@ -101,6 +102,7 @@ async def summarize_command(
         except TranscriptError as exc:
             await interaction.followup.send(
                 f"❌ Failed to obtain transcript: {exc}",
+                ephemeral=True,
             )
             return
 
@@ -118,6 +120,7 @@ async def summarize_command(
             logger.exception("Summarization failed for %s", video_id)
             await interaction.followup.send(
                 f"❌ Summarization failed: {exc}",
+                ephemeral=True,
             )
             return
 
