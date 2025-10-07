@@ -95,11 +95,6 @@ The recommended way to run tldwbot in production is with Docker Compose:
 
 **GPU Support**: If using local Whisper with GPU acceleration, uncomment the GPU passthrough block in `docker-compose.yml`. Requires [NVIDIA Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit).
 
-### Forcing Refresh & Prompt Overrides
-
-- `force_refresh`: `/summarize url:<video> force_refresh:true`
-- `prompt_override`: `/summarize url:<video> prompt_override:"Your custom instructions"`
-
 ## Docker Deployment
 
 Build and run the container:
@@ -122,8 +117,6 @@ docker run \
 
 - **transcripts**: `video_id`, `source`, `text`, `created_at`
 - **summaries**: `video_id`, `prompt_hash`, `model`, `summary`, `created_at`
-
-Use `/summarize force_refresh:true` to bypass cached entries.
 
 ## Notes
 

@@ -15,6 +15,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .storage import Storage
+from .cache_sqlite import get as cache_get_persist, set as cache_set_persist
+from .limiters import TokenBucket, SlidingWindowCounter, CircuitBreaker429, full_jitter_sleep
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,27 @@ YT_COOKIES = os.getenv("YT_COOKIES")  # optional path to cookies.txt
 YT_UA = os.getenv("YT_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
 YT_REQ_SLEEP = float(os.getenv("YT_REQ_SLEEP", "0"))  # seconds between external requests
 YT_CACHE_TTL = int(os.getenv("YT_CACHE_TTL", "7200"))  # 2h
+
+# Rate control
+RATE_RPS = float(os.getenv("RATE_RPS", "1.0"))  # tokens per second
+RATE_BURST = int(os.getenv("RATE_BURST", "2"))  # burst size for token bucket
+RETRY_MAX = int(os.getenv("RETRY_MAX", "3"))  # per video fetch
+RETRY_BASE_SEC = float(os.getenv("RETRY_BASE_SEC", "1.0"))  # backoff base
+
+# Circuit breaker for 429
+CB_429_THRESHOLD = int(os.getenv("CB_429_THRESHOLD", "3"))  # consecutive 429s to open
+CB_OPEN_SECS = int(os.getenv("CB_OPEN_SECS", "1800"))  # 30 min open
+CB_HALF_PROBE_SECS = int(os.getenv("CB_HALF_PROBE_SECS", "120"))  # next probe delay
+
+# Quotas
+USER_QUOTA_MAX = int(os.getenv("USER_QUOTA_MAX", "5"))  # 5 videos / window
+USER_QUOTA_WINDOW = int(os.getenv("USER_QUOTA_WINDOW", "600"))
+CHAN_QUOTA_MAX = int(os.getenv("CHAN_QUOTA_MAX", "20"))  # 20 videos / window
+CHAN_QUOTA_WINDOW = int(os.getenv("CHAN_QUOTA_WINDOW", "600"))
+
+# Persistent cache
+CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "/app/cache.db")
+PERSIST_TTL_SECS = int(os.getenv("PERSIST_TTL_SECS", os.getenv("YT_CACHE_TTL", "86400")))  # default 1d
 
 # Browser-like headers for direct requests
 BROWSER_HEADERS = {
@@ -45,6 +68,12 @@ _session.mount("http://", HTTPAdapter(max_retries=retries))
 _cache_lock = threading.Lock()
 _cache: dict[str, tuple[float, str]] = {}  # video_id -> (expires_at, text)
 _inflight: dict[str, threading.Event] = {}  # video_id -> event
+
+# Rate limiters and circuit breaker
+_BUCKET = TokenBucket(RATE_RPS, RATE_BURST)
+_USERQ = SlidingWindowCounter(USER_QUOTA_WINDOW)
+_CHANQ = SlidingWindowCounter(CHAN_QUOTA_WINDOW)
+_CB429 = CircuitBreaker429(CB_429_THRESHOLD, CB_OPEN_SECS, CB_HALF_PROBE_SECS)
 
 
 def _cache_get(video_id: str) -> Optional[str]:
@@ -80,6 +109,33 @@ def _single_flight_done(video_id: str):
         ev = _inflight.pop(video_id, None)
         if ev:
             ev.set()
+
+
+def _before_network_call(user_id: str | int | None, channel_id: str | int | None):
+    # circuit breaker
+    _CB429.before()
+    # quotas
+    if user_id is not None and _USERQ.count(str(user_id)) >= USER_QUOTA_MAX:
+        raise TranscriptError("User quota exceeded; try later.")
+    if channel_id is not None and _CHANQ.count(str(channel_id)) >= CHAN_QUOTA_MAX:
+        raise TranscriptError("Channel quota exceeded; try later.")
+    # token bucket pacing
+    wait = _BUCKET.take()
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _record_result(ok: bool, rate_limited: bool, user_id: str | int | None, channel_id: str | int | None):
+    if user_id is not None:
+        _USERQ.add(str(user_id))
+    if channel_id is not None:
+        _CHANQ.add(str(channel_id))
+    if ok:
+        _CB429.on_success()
+    elif rate_limited:
+        _CB429.on_429()
+    else:
+        _CB429.on_other_error()
 
 
 YOUTUBE_ID_REGEX = re.compile(
@@ -429,6 +485,41 @@ def fetch_captions(video_id: str) -> Optional[TranscriptResult]:
         return None
     finally:
         _single_flight_done(video_id)
+
+
+def guarded_fetch_captions(video_id: str, user_id: str | int | None = None, channel_id: str | int | None = None) -> Optional[TranscriptResult]:
+    """
+    Wraps fetch_captions with quotas, token bucket, circuit breaker, and persistent cache.
+    """
+    # persistent cache (fast path)
+    hit = cache_get_persist(video_id, PERSIST_TTL_SECS, CACHE_DB_PATH)
+    if hit:
+        text, source = hit
+        return TranscriptResult(text=text, source=f"cache:{source}", language="en")
+
+    # single-flight is assumed already present in your code; keep it.
+    _before_network_call(user_id, channel_id)
+    rate_limited = False
+    try:
+        # call your existing fetch_captions(video_id) implementation (do not duplicate logic)
+        res = fetch_captions(video_id)
+        if res and res.text:
+            cache_set_persist(video_id, res.text, res.source, CACHE_DB_PATH)
+            _record_result(ok=True, rate_limited=False, user_id=user_id, channel_id=channel_id)
+            return res
+        _record_result(ok=False, rate_limited=False, user_id=user_id, channel_id=channel_id)
+        return None
+    except TranscriptError as e:
+        # if message indicates rate limiting, mark it
+        msg = str(e).lower()
+        rate_limited = ("rate limit" in msg) or ("429" in msg) or ("too many requests" in msg)
+        _record_result(ok=False, rate_limited=rate_limited, user_id=user_id, channel_id=channel_id)
+        raise
+    except RuntimeError as e:
+        # circuit-open
+        if "circuit-open" in str(e):
+            raise TranscriptError("Temporarily cooling down due to YouTube limits; please try later.")
+        raise
 
 
 def obtain_transcript(

@@ -19,10 +19,18 @@ from openai import OpenAI
 
 from .storage import Storage
 from .summarize import compute_summary_cache_key, summarize_transcript, DEFAULT_PROMPT
-from .transcripts import TranscriptError, extract_video_id, obtain_transcript
+from .transcripts import TranscriptError, extract_video_id, obtain_transcript, guarded_fetch_captions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tldwbot")
+
+# Deduplication: track recent requests to avoid duplicate processing
+_recent_requests: dict[tuple, float] = {}
+_recent_lock = asyncio.Lock()
+_DEDUP_TTL = 600  # 10 minutes
+
+# Concurrency limiting
+_worker_semaphore = asyncio.Semaphore(2)
 
 
 def getenv_bool(key: str, default: bool = False) -> bool:
@@ -66,8 +74,6 @@ class SummaryBot(commands.Bot):
 async def summarize_command(
     interaction: discord.Interaction,
     url: str,
-    force_refresh: bool,
-    prompt_override: Optional[str],
     bot: SummaryBot,
 ) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -79,64 +85,99 @@ async def summarize_command(
         )
         return
 
-    prompt_to_use = (prompt_override or DEFAULT_PROMPT).strip()
-    prompt_hash = compute_summary_cache_key(
-        video_id=video_id, prompt=prompt_to_use, model=bot.summary_model
-    )
+    # Deduplication check
+    user_id = interaction.user.id
+    channel_id = interaction.channel_id if interaction.channel_id else 0
+    dedup_key = (channel_id, interaction.id, video_id)
 
-    summary_record = None if force_refresh else bot.storage.get_summary(video_id, prompt_hash, bot.summary_model)
-    transcript_result = None
+    async with _recent_lock:
+        now = asyncio.get_event_loop().time()
+        # Clean old entries
+        to_remove = [k for k, ts in _recent_requests.items() if now - ts > _DEDUP_TTL]
+        for k in to_remove:
+            del _recent_requests[k]
 
-    if summary_record:
-        summary_text = summary_record.summary
-        transcript_result = bot.storage.get_transcript(video_id)
-        transcript_source = transcript_result.source if transcript_result else "unknown"
-        logger.info("Summary cache hit for %s", video_id)
-    else:
-        try:
-            transcript_result = await asyncio.to_thread(
-                obtain_transcript,
-                bot.storage,
-                video_id,
-                force_refresh=force_refresh,
-                use_local_whisper=bot.use_local_whisper,
-                whisper_model_size=bot.whisper_model_size,
-                openai_client=bot.openai_client,
-            )
-        except TranscriptError as exc:
+        if dedup_key in _recent_requests:
             await interaction.followup.send(
-                f"❌ Failed to obtain transcript: {exc}",
+                "⏭️ This video is already being processed.",
                 ephemeral=True,
             )
             return
+        _recent_requests[dedup_key] = now
 
-        transcript_source = transcript_result.source
-        try:
-            summary_text = await asyncio.to_thread(
-                summarize_transcript,
-                transcript_result.text,
-                client=bot.openai_client,
-                model=bot.summary_model,
-                max_chars_per_chunk=bot.max_chars_per_chunk,
-                prompt_override=prompt_override,
-            )
-        except Exception as exc:  # pragma: no cover
-            logger.exception("Summarization failed for %s", video_id)
-            await interaction.followup.send(
-                f"❌ Summarization failed: {exc}",
-                ephemeral=True,
-            )
-            return
+    # Concurrency limiting
+    async with _worker_semaphore:
+        prompt_to_use = DEFAULT_PROMPT.strip()
+        prompt_hash = compute_summary_cache_key(
+            video_id=video_id, prompt=prompt_to_use, model=bot.summary_model
+        )
 
-        bot.storage.upsert_summary(video_id, prompt_hash, bot.summary_model, summary_text)
+        summary_record = bot.storage.get_summary(video_id, prompt_hash, bot.summary_model)
+        transcript_result = None
 
-    await send_summary_response(
-        interaction,
-        video_id=video_id,
-        transcript_source=transcript_source,
-        summary_text=summary_text,
-        max_discord_chars=bot.max_discord_chars,
-    )
+        if summary_record:
+            summary_text = summary_record.summary
+            transcript_result = bot.storage.get_transcript(video_id)
+            transcript_source = transcript_result.source if transcript_result else "unknown"
+            logger.info("Summary cache hit for %s", video_id)
+        else:
+            try:
+                transcript_result = await asyncio.to_thread(
+                    guarded_fetch_captions,
+                    video_id,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                )
+                if not transcript_result:
+                    await interaction.followup.send(
+                        "❌ No captions available for this video.",
+                        ephemeral=True,
+                    )
+                    return
+            except TranscriptError as exc:
+                msg = str(exc)
+                if "quota exceeded" in msg.lower() or "cooling down" in msg.lower():
+                    await interaction.followup.send(
+                        f"⏸️ {exc}",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"❌ Failed to obtain transcript: {exc}",
+                        ephemeral=True,
+                    )
+                return
+
+            # Store transcript in storage
+            bot.storage.upsert_transcript(video_id, transcript_result.source, transcript_result.text)
+
+            transcript_source = transcript_result.source
+            try:
+                summary_text = await asyncio.to_thread(
+                    summarize_transcript,
+                    transcript_result.text,
+                    client=bot.openai_client,
+                    model=bot.summary_model,
+                    max_chars_per_chunk=bot.max_chars_per_chunk,
+                    prompt_override=None,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.exception("Summarization failed for %s", video_id)
+                await interaction.followup.send(
+                    f"❌ Summarization failed: {exc}",
+                    ephemeral=True,
+                )
+                return
+
+            bot.storage.upsert_summary(video_id, prompt_hash, bot.summary_model, summary_text)
+
+        await send_summary_response(
+            interaction,
+            video_id=video_id,
+            transcript_source=transcript_source,
+            summary_text=summary_text,
+            max_discord_chars=bot.max_discord_chars,
+        )
 
 
 def split_for_discord(text: str, limit: int) -> list[str]:
@@ -233,20 +274,14 @@ def main() -> None:
     @bot.tree.command(name="summarize", description="Summarize a YouTube video")
     @app_commands.describe(
         url="YouTube video URL or ID",
-        force_refresh="Bypass cached transcript and summary",
-        prompt_override="Override the default summary prompt",
     )
     async def summarize(  # type: ignore[unused-ignore]
         interaction: discord.Interaction,
         url: str,
-        force_refresh: bool = False,
-        prompt_override: Optional[str] = None,
     ) -> None:
         await summarize_command(
             interaction,
             url,
-            force_refresh,
-            prompt_override,
             bot,
         )
 
