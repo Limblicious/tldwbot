@@ -159,7 +159,6 @@ async def summarize_command(
                     client=bot.openai_client,
                     model=bot.summary_model,
                     max_chars_per_chunk=bot.max_chars_per_chunk,
-                    prompt_override=None,
                 )
             except Exception as exc:  # pragma: no cover
                 logger.exception("Summarization failed for %s", video_id)

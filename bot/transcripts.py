@@ -169,18 +169,6 @@ def extract_video_id(url_or_id: str) -> Optional[str]:
     return None
 
 
-def get_cached_transcript(
-    storage: Storage, video_id: str, force_refresh: bool
-) -> Optional[TranscriptResult]:
-    if force_refresh:
-        return None
-    record = storage.get_transcript(video_id)
-    if record:
-        logger.info("Transcript cache hit for %s via %s", video_id, record.source)
-        return TranscriptResult(text=record.text, source=record.source)
-    return None
-
-
 def parse_vtt(vtt_content: str) -> str:
     """Parse VTT subtitle format and extract plain text."""
     lines = []
@@ -526,7 +514,6 @@ def obtain_transcript(
     storage: Storage,
     video_id: str,
     *,
-    force_refresh: bool,
     use_local_whisper: bool = False,
     whisper_model_size: str = "",
     openai_client: Optional[object] = None,
@@ -537,10 +524,14 @@ def obtain_transcript(
     Primary: youtube-transcript-api (manual -> auto -> translate->en)
     Secondary: yt-dlp (stdout or direct-URL fallback). No Whisper fallback.
     Raises TranscriptError if captions are unavailable or if YouTube rate limits (429).
+
+    NOTE: This function is deprecated. Use guarded_fetch_captions() instead.
     """
-    cached = get_cached_transcript(storage, video_id, force_refresh)
-    if cached:
-        return cached
+    # Check storage cache
+    record = storage.get_transcript(video_id)
+    if record:
+        logger.info("Transcript cache hit for %s via %s", video_id, record.source)
+        return TranscriptResult(text=record.text, source=record.source)
 
     # Fetch captions only - no Whisper fallback
     captions = fetch_captions(video_id)
