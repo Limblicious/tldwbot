@@ -11,8 +11,7 @@ A production-ready Discord bot that turns any YouTube video into a structured, a
   3. OpenAI Whisper (`whisper-1`) when captions/local transcription are unavailable
 - Structured Markdown summaries with TL;DR, key points, timestamped outline, notable quotes, action items, and caveats.
 - Automatic chunking for long transcripts and final merge summarization.
-- SQLite caching for transcripts and summaries with force-refresh support.
-- Custom prompt overrides per request.
+- SQLite caching for transcripts and summaries.
 - Discord-safe message splitting with automatic `.txt` attachments for long outputs.
 - Docker-ready deployment with ffmpeg and all dependencies.
 

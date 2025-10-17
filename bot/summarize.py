@@ -114,9 +114,8 @@ def summarize_transcript(
     client: OpenAI,
     model: str,
     max_chars_per_chunk: int,
-    prompt_override: Optional[str] = None,
 ) -> str:
-    base_prompt = (prompt_override or DEFAULT_PROMPT).strip()
+    base_prompt = DEFAULT_PROMPT.strip()
     chunks = chunk_transcript(transcript, max_chars_per_chunk)
     if not chunks:
         raise ValueError("Transcript is empty")
