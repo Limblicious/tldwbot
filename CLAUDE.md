@@ -80,6 +80,37 @@ This file contains strict guidelines for future edits to the tldwbot codebase.
 - Do not use Whisper fallback in this project.
 - Always keep yt-dlp upgraded to the latest version in Dockerfile.
 
+## Timestamp Preservation
+
+- **Always preserve timestamps** when parsing VTT subtitle files in `bot/transcripts.py::parse_vtt()`.
+- The `parse_vtt()` function **must** extract timestamps from VTT lines (format: `HH:MM:SS.mmm --> HH:MM:SS.mmm`) and prefix each subtitle line with its timestamp in `[MM:SS]` or `[HH:MM:SS]` format.
+- **Never** strip timestamps from transcripts during parsing.
+- Timestamps are critical for the "Notable Quotes" section in summaries.
+- **Do not** modify the timestamp extraction logic without verifying that quotes still include timestamps in the final summary output.
+
+## Summarization Prompts
+
+- All summarization prompts in `bot/summarize.py` **must** explicitly request timestamps for notable quotes.
+- The required format for notable quotes is: `- [MM:SS] "Quote text here"`
+- Prompts must include the phrase "with timestamps in [MM:SS] format" when describing the Notable Quotes section.
+- This applies to:
+  - `DEFAULT_PROMPT`
+  - `CHUNK_PROMPT`
+  - `MERGE_PROMPT`
+  - One-shot summarization prompts
+  - Final merge prompts in hierarchical summarization
+- **Never** remove timestamp requirements from these prompts, as it will break the feature.
+
+## Summary Structure
+
+- Summaries **must** follow this exact structure:
+  1. **TL;DW** — 2-3 sentence overview
+  2. **Key Points** — bulleted list (longest section, ≤10 bullets, ≤15 words each)
+  3. **Notable Quotes** — bullet list with timestamps in `[MM:SS]` format (≤3 quotes)
+  4. **Caveats & Limitations** — bullet list of uncertainties (≤3 bullets)
+- **Do not** add extra sections like "Action Items" or "Timestamped Outline" unless explicitly requested by the user.
+- **Do not** remove any of these sections from the prompts or change their order.
+
 ---
 
 When in doubt, preserve existing behavior and consult this document.
