@@ -1,6 +1,7 @@
 """Transcript acquisition pipeline for YouTube videos."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -48,6 +49,16 @@ CHAN_QUOTA_WINDOW = int(os.getenv("CHAN_QUOTA_WINDOW", "600"))
 CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "/app/cache.db")
 PERSIST_TTL_SECS = int(os.getenv("PERSIST_TTL_SECS", os.getenv("YT_CACHE_TTL", "86400")))  # default 1d
 
+# Additional pacing / cooldown
+NEG_CACHE_TTL = int(os.getenv("NEG_CACHE_TTL", "3600"))  # per-video cooldown after 429 (1h)
+JITTER_MAX_MS = int(os.getenv("JITTER_MAX_MS", "800"))   # stable jitter cap (0–800ms)
+
+# VTT file cleanup
+KEEP_VTT = os.getenv("KEEP_VTT", "0") in ("1", "true", "True")
+
+# Subprocess timeout protection
+YTDLP_TIMEOUT_SEC = int(os.getenv("YTDLP_TIMEOUT_SEC", "90"))  # 90s timeout for yt-dlp calls
+
 # Browser-like headers for direct requests
 BROWSER_HEADERS = {
     "User-Agent": YT_UA,
@@ -60,7 +71,12 @@ BROWSER_HEADERS = {
 
 # Requests session with retry policy
 _session = requests.Session()
-retries = Retry(total=3, backoff_factor=1.2, status_forcelist=(429, 500, 502, 503, 504))
+retries = Retry(
+    total=3,
+    backoff_factor=1.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    respect_retry_after_header=True,
+)
 _session.mount("https://", HTTPAdapter(max_retries=retries))
 _session.mount("http://", HTTPAdapter(max_retries=retries))
 
@@ -74,6 +90,61 @@ _BUCKET = TokenBucket(RATE_RPS, RATE_BURST)
 _USERQ = SlidingWindowCounter(USER_QUOTA_WINDOW)
 _CHANQ = SlidingWindowCounter(CHAN_QUOTA_WINDOW)
 _CB429 = CircuitBreaker429(CB_429_THRESHOLD, CB_OPEN_SECS, CB_HALF_PROBE_SECS)
+
+# Simple metrics counters
+_metrics = {
+    "fetch_attempts": 0,
+    "fetch_429": 0,
+    "neg_cache_hits": 0,
+    "direct_url_first_hits": 0,
+    "stdout_hits": 0,
+}
+
+# Negative cache for per-video cooldown after 429
+_neg_cache_lock = threading.Lock()
+_neg_cache: dict[str, float] = {}  # video_id -> expires_at
+
+
+def _purge_leftover_vtts():
+    """Delete any leftover .vtt files from previous runs (unless KEEP_VTT=1)."""
+    if KEEP_VTT:
+        return
+    try:
+        from pathlib import Path
+        for p in Path.cwd().glob("*.vtt"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# Purge leftover VTT files on module load
+_purge_leftover_vtts()
+
+
+def _neg_cache_set(video_id: str):
+    with _neg_cache_lock:
+        _neg_cache[video_id] = time.time() + NEG_CACHE_TTL
+
+
+def _neg_cache_get(video_id: str) -> bool:
+    with _neg_cache_lock:
+        exp = _neg_cache.get(video_id)
+        if not exp:
+            return False
+        if time.time() > exp:
+            _neg_cache.pop(video_id, None)
+            return False
+        return True
+
+
+def _stable_jitter(video_id: str):
+    """Deterministic jitter (0..JITTER_MAX_MS ms) based on video_id."""
+    h = abs(hash(video_id)) % (JITTER_MAX_MS + 1)
+    if h:
+        time.sleep(h / 1000.0)
 
 
 def _cache_get(video_id: str) -> Optional[str]:
@@ -170,21 +241,52 @@ def extract_video_id(url_or_id: str) -> Optional[str]:
 
 
 def parse_vtt(vtt_content: str) -> str:
-    """Parse VTT subtitle format and extract plain text."""
+    """Parse VTT subtitle format and extract text with timestamps."""
     lines = []
+    current_timestamp = None
+
     for line in vtt_content.split('\n'):
         line = line.strip()
-        # Skip WEBVTT header, timestamp lines, and empty lines
-        if not line or line.startswith('WEBVTT') or '-->' in line or line.isdigit():
+
+        # Skip WEBVTT header, empty lines, and metadata
+        if not line or line.startswith('WEBVTT') or line.isdigit():
             continue
-        # Skip metadata lines
         if line.startswith('Kind:') or line.startswith('Language:'):
             continue
-        lines.append(line)
+
+        # Extract timestamp from lines like "00:00:05.000 --> 00:00:08.000"
+        if '-->' in line:
+            # Extract start timestamp (before the -->)
+            timestamp_part = line.split('-->')[0].strip()
+            # Convert to [MM:SS] or [HH:MM:SS] format
+            # VTT format is typically HH:MM:SS.mmm or MM:SS.mmm
+            time_parts = timestamp_part.split(':')
+            if len(time_parts) == 3:
+                # HH:MM:SS.mmm format
+                hh, mm, ss = time_parts
+                ss = ss.split('.')[0]  # Remove milliseconds
+                if hh == '00':
+                    current_timestamp = f"[{mm}:{ss}]"
+                else:
+                    current_timestamp = f"[{hh}:{mm}:{ss}]"
+            elif len(time_parts) == 2:
+                # MM:SS.mmm format
+                mm, ss = time_parts
+                ss = ss.split('.')[0]
+                current_timestamp = f"[{mm}:{ss}]"
+            continue
+
+        # Append text lines with timestamp prefix
+        if current_timestamp and line:
+            lines.append(f"{current_timestamp} {line}")
+            current_timestamp = None  # Reset after using
+        elif line:
+            lines.append(line)
+
     return '\n'.join(lines)
 
 
-def fetch_transcript(url: str) -> Optional[str]:
+def fetch_transcript(url: str, tl=None) -> Optional[str]:
     """
     Try to fetch subtitles via yt-dlp, preferring manual then auto-generated.
     Accept English variants (en, en-US, en-GB, ...). Return plain text or None.
@@ -195,38 +297,14 @@ def fetch_transcript(url: str) -> Optional[str]:
     logger = logging.getLogger(__name__)
     rate_limited = False
 
-    # Accept English variants; yt-dlp expects --sub-langs for lists/patterns.
-    lang_expr = "en.*,en"
-
-    def _run_and_parse(cmd: list[str]) -> Optional[str]:
-        nonlocal rate_limited
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=45,
-            )
-        except subprocess.TimeoutExpired:
-            return None
-
-        # success path
-        if result.returncode == 0 and result.stdout:
-            text = parse_vtt(result.stdout)
-            return text.strip() or None
-
-        # detect rate limiting in stderr
-        err = (result.stderr or "")
-        if " 429" in err or "Too Many Requests" in err:
-            rate_limited = True
-            logger.warning("yt-dlp returned 429 / Too Many Requests for %s; will try fallbacks", url)
-        return None
-
     def _build_yt_dlp_cmd(base_cmd: list[str]) -> list[str]:
         """Add hardening options to yt-dlp command."""
         cmd = base_cmd.copy()
         # Insert options after 'yt-dlp' (position 1)
         insert_pos = 1
+        # Reliability knobs
+        cmd[insert_pos:insert_pos] = ["--retries", "3", "--retry-sleep", "1", "--socket-timeout", "15"]
+        insert_pos += 6
         if YT_COOKIES:
             cmd[insert_pos:insert_pos] = ["--cookies", YT_COOKIES]
             insert_pos += 2
@@ -241,15 +319,60 @@ def fetch_transcript(url: str) -> Optional[str]:
             insert_pos += 2
         return cmd
 
+    def _print_and_fetch(is_auto: bool) -> Optional[str]:
+        """
+        Low-cost direct-URL discovery via JSON print.
+        Prefer this because it's cheap and avoids subtitle-file writes.
+        """
+        nonlocal rate_limited
+        # Get the subtitle structure as JSON
+        print_tpl = "automatic_captions%()j" if is_auto else "subtitles%()j"
+        cmd = ["yt-dlp", "--skip-download", "--no-playlist", "--print", print_tpl, url]
+        cmd = _build_yt_dlp_cmd(cmd)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            return None
+        if r.returncode != 0:
+            if r.stderr and (" 429" in r.stderr or "Too Many Requests" in r.stderr):
+                rate_limited = True
+            return None
+        try:
+            data = r.stdout.strip()
+            if not data:
+                return None
+            payload = json.loads(data)
+            # payload maps language -> [ {url: ... , ext: ...}, ... ]
+            for lang, entries in (payload or {}).items():
+                if not lang or not lang.lower().startswith("en"):  # accept en variants
+                    continue
+                for ent in entries or []:
+                    if ent.get("ext") != "vtt":  # prefer vtt
+                        continue
+                    vtt_url = ent.get("url")
+                    if not vtt_url:
+                        continue
+                    if YT_REQ_SLEEP:
+                        time.sleep(YT_REQ_SLEEP)
+                    resp = _session.get(vtt_url, headers=BROWSER_HEADERS, timeout=30)
+                    if resp.status_code == 429:
+                        rate_limited = True
+                        return None
+                    resp.raise_for_status()
+                    text = parse_vtt(resp.text).strip()
+                    if text:
+                        _metrics["direct_url_first_hits"] += 1
+                        return text
+        except Exception:
+            return None
+        return None
+
     def _direct_url_fallback(auto: bool) -> Optional[str]:
         """
-        Some yt-dlp builds won't stream subs to stdout with -o -.
-        As a fallback, print the subtitle data structure and parse for VTT URL.
+        Legacy fallback: print the subtitle data structure and parse for VTT URL.
         """
         nonlocal rate_limited
         try:
-            import json
-
             # Get the full subtitle structure as JSON
             if auto:
                 dict_key = "automatic_captions"
@@ -263,7 +386,7 @@ def fetch_transcript(url: str) -> Optional[str]:
                 "--print", f"%({dict_key})j",
                 url,
             ])
-            pr = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            pr = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_TIMEOUT_SEC)
             if pr.returncode != 0 or not pr.stdout.strip():
                 return None
 
@@ -334,50 +457,45 @@ def fetch_transcript(url: str) -> Optional[str]:
             logger.debug("Direct URL fallback failed: %s", str(e)[:100])
             return None
 
-    # Try MANUAL subs first
-    cmd_manual = _build_yt_dlp_cmd([
-        "yt-dlp",
-        "--skip-download",
-        "--no-playlist",
-        "--write-subs",                 # manual subs
-        "--sub-langs", lang_expr,       # NOTE: plural 'sub-langs'
-        "--sub-format", "vtt",
-        "-o", "-",                      # stream to stdout if supported
-        url,
-    ])
-    txt = _run_and_parse(cmd_manual)
+    # Bump fetch attempts metric
+    _metrics["fetch_attempts"] += 1
+
+    # REORDERED: Prefer low-cost direct-URL JSON print first
+
+    # Try MANUAL subs via direct JSON path (cheap)
+    if tl:
+        with tl.span("ytdlp_print_manual"):
+            txt = _print_and_fetch(is_auto=False)
+    else:
+        txt = _print_and_fetch(is_auto=False)
     if txt:
-        logger.info("Fetched manual subtitles for %s", url)
+        logger.info("Fetched manual subtitles via direct-URL for %s", url)
         return txt
 
-    # If we didn't get it via stdout, try direct-URL fallback for manual subs
+    # Try AUTO subs via direct JSON path (cheap)
+    if tl:
+        with tl.span("ytdlp_print_auto"):
+            txt = _print_and_fetch(is_auto=True)
+    else:
+        txt = _print_and_fetch(is_auto=True)
+    if txt:
+        logger.info("Fetched auto-generated subtitles via direct-URL for %s", url)
+        return txt
+
+    logger.info("No manual subtitles via direct JSON, trying legacy direct-URL for %s", url)
+
+    # Try the legacy direct-URL fallback for manual subs
     txt = _direct_url_fallback(auto=False)
     if txt:
-        logger.info("Fetched manual subtitles via direct URL for %s", url)
+        logger.info("Fetched manual subtitles via legacy direct-URL for %s", url)
         return txt
 
-    logger.info("No manual subtitles, trying auto-generated for %s", url)
+    logger.info("No manual subtitles, trying auto-generated legacy for %s", url)
 
-    # Try AUTO-GENERATED subs
-    cmd_auto = _build_yt_dlp_cmd([
-        "yt-dlp",
-        "--skip-download",
-        "--no-playlist",
-        "--write-auto-subs",            # auto-generated subs
-        "--sub-langs", lang_expr,       # accept en variants
-        "--sub-format", "vtt",
-        "-o", "-",
-        url,
-    ])
-    txt = _run_and_parse(cmd_auto)
-    if txt:
-        logger.info("Fetched auto-generated subtitles for %s", url)
-        return txt
-
-    # Direct URL fallback for auto
+    # Try the legacy direct-URL fallback for auto subs
     txt = _direct_url_fallback(auto=True)
     if txt:
-        logger.info("Fetched auto-generated subtitles via direct URL for %s", url)
+        logger.info("Fetched auto-generated subtitles via legacy direct-URL for %s", url)
         return txt
 
     if rate_limited:
@@ -385,13 +503,23 @@ def fetch_transcript(url: str) -> Optional[str]:
     return None
 
 
-def fetch_captions(video_id: str) -> Optional[TranscriptResult]:
+def fetch_captions(video_id: str, tl=None) -> Optional[TranscriptResult]:
     """
     Primary path: youtube-transcript-api (manual → auto → translate to en)
     Secondary path: yt-dlp subprocess with English variants
     """
+    # Check negative cache (per-video cooldown after 429)
+    if _neg_cache_get(video_id):
+        _metrics["neg_cache_hits"] += 1
+        raise TranscriptError("Temporarily cooling down on this video due to prior rate limiting.")
+
     # cache hit fast-path
-    cached = _cache_get(video_id)
+    if tl:
+        with tl.span("memory_cache_get"):
+            cached = _cache_get(video_id)
+    else:
+        cached = _cache_get(video_id)
+
     if cached:
         return TranscriptResult(text=cached, source="cache", language="en")
 
@@ -405,69 +533,99 @@ def fetch_captions(video_id: str) -> Optional[TranscriptResult]:
     try:
         url = f"https://www.youtube.com/watch?v={video_id}"
 
+        # Apply stable jitter based on video_id
+        if tl:
+            with tl.span("stable_jitter"):
+                _stable_jitter(video_id)
+        else:
+            _stable_jitter(video_id)
+
         # --- Primary: youtube-transcript-api ---
-        try:
-            from youtube_transcript_api import (
-                YouTubeTranscriptApi,
-                NoTranscriptFound,
-                TranscriptsDisabled,
-                VideoUnavailable,
-            )
+        # TEMPORARILY DISABLED: youtube-transcript-api has XML parsing issues with some videos
+        # Skip directly to yt-dlp fallback which is more reliable
+        skip_ytapi = True
+        if not skip_ytapi:
+            try:
+                from youtube_transcript_api import (
+                    YouTubeTranscriptApi,
+                    NoTranscriptFound,
+                    TranscriptsDisabled,
+                    VideoUnavailable,
+                )
 
-            # Use cookies from env for age/region restrictions
-            cookies_path = YT_COOKIES or None
+                # Use cookies from env for age/region restrictions
+                cookies_path = YT_COOKIES or None
 
-            tl = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookies_path)
+                if tl:
+                    with tl.span("yt_transcript_api"):
+                        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookies_path)
+                else:
+                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookies_path)
 
-            # Prefer manually-created English first
-            for finder in (tl.find_manually_created_transcript, tl.find_generated_transcript):
-                try:
-                    t = finder(["en", "en-US", "en-GB", "en-AU", "en-CA"])
-                    parts = t.fetch()
-                    text = "\n".join(
-                        s["text"].replace("\n", " ").strip()
-                        for s in parts
-                        if s.get("text", "").strip()
-                    ).strip()
-                    if text:
-                        _cache_set(video_id, text)
-                        src = "yt-api-manual" if finder is tl.find_manually_created_transcript else "yt-api-auto"
-                        return TranscriptResult(text=text, source=src, language=getattr(t, "language_code", "en"))
-                except Exception:
-                    pass
+                # Prefer manually-created English first
+                for finder in (transcript_list.find_manually_created_transcript, transcript_list.find_generated_transcript):
+                    try:
+                        t = finder(["en", "en-US", "en-GB", "en-AU", "en-CA"])
+                        parts = t.fetch()
+                        text = "\n".join(
+                            s["text"].replace("\n", " ").strip()
+                            for s in parts
+                            if s.get("text", "").strip()
+                        ).strip()
+                        if text:
+                            _cache_set(video_id, text)
+                            src = "yt-api-manual" if finder is transcript_list.find_manually_created_transcript else "yt-api-auto"
+                            return TranscriptResult(text=text, source=src, language=getattr(t, "language_code", "en"))
+                    except Exception:
+                        pass
 
-            # Translate any available track to English if needed
-            for t in tl:
-                try:
-                    t_en = t.translate("en")
-                    parts = t_en.fetch()
-                    text = "\n".join(
-                        s["text"].replace("\n", " ").strip()
-                        for s in parts
-                        if s.get("text", "").strip()
-                    ).strip()
-                    if text:
-                        _cache_set(video_id, text)
-                        return TranscriptResult(text=text, source="yt-api-translated", language="en")
-                except Exception:
-                    continue
+                # Translate any available track to English if needed
+                for t in transcript_list:
+                    try:
+                        t_en = t.translate("en")
+                        parts = t_en.fetch()
+                        text = "\n".join(
+                            s["text"].replace("\n", " ").strip()
+                            for s in parts
+                            if s.get("text", "").strip()
+                        ).strip()
+                        if text:
+                            _cache_set(video_id, text)
+                            return TranscriptResult(text=text, source="yt-api-translated", language="en")
+                    except Exception:
+                        continue
 
-        except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
-            pass
-        except Exception as e:
-            # Check for rate limiting
-            error_str = str(e).lower()
-            if "429" in error_str or "too many requests" in error_str:
-                logger.error("YouTube rate limit hit for video %s: %s", video_id, str(e)[:200])
-                raise TranscriptError("YouTube is temporarily rate limiting requests. Try again later or provide cookies (YT_COOKIES).")
-            # Network, cookie, or other transient issues – fall through to yt-dlp path
-            logger.debug("youtube-transcript-api failed for %s, trying yt-dlp: %s", video_id, str(e)[:100])
+            except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable):
+                pass
+            except Exception as e:
+                # Check for rate limiting
+                error_str = str(e).lower()
+                if "429" in error_str or "too many requests" in error_str:
+                    logger.error("YouTube rate limit hit for video %s: %s", video_id, str(e)[:200])
+                    _neg_cache_set(video_id)
+                    _metrics["fetch_429"] += 1
+                    raise TranscriptError("YouTube is temporarily rate limiting requests. Try again later or provide cookies (YT_COOKIES).")
+                # Network, cookie, or other transient issues – fall through to yt-dlp path
+                logger.debug("youtube-transcript-api failed for %s, trying yt-dlp: %s", video_id, str(e)[:100])
 
         # --- Secondary: yt-dlp subprocess path (fixed flags) ---
-        text = fetch_transcript(url)
-        if text:
-            _cache_set(video_id, text)
-            return TranscriptResult(text=text, source="yt-dlp", language="en")
+        try:
+            if tl:
+                with tl.span("yt_dlp_subprocess"):
+                    text = fetch_transcript(url, tl=tl)
+            else:
+                text = fetch_transcript(url)
+
+            if text:
+                _cache_set(video_id, text)
+                return TranscriptResult(text=text, source="yt-dlp", language="en")
+        except TranscriptError as e:
+            # Check if it's a rate limit error from fetch_transcript
+            msg = str(e).lower()
+            if "rate limit" in msg or "429" in msg or "too many requests" in msg:
+                _neg_cache_set(video_id)
+                _metrics["fetch_429"] += 1
+            raise
 
         logger.error("No captions available for video %s", video_id)
         return None
@@ -475,39 +633,65 @@ def fetch_captions(video_id: str) -> Optional[TranscriptResult]:
         _single_flight_done(video_id)
 
 
-def guarded_fetch_captions(video_id: str, user_id: str | int | None = None, channel_id: str | int | None = None) -> Optional[TranscriptResult]:
+def guarded_fetch_captions(video_id: str, user_id: str | int | None = None, channel_id: str | int | None = None, tl=None) -> Optional[TranscriptResult]:
     """
     Wraps fetch_captions with quotas, token bucket, circuit breaker, and persistent cache.
     """
-    # persistent cache (fast path)
-    hit = cache_get_persist(video_id, PERSIST_TTL_SECS, CACHE_DB_PATH)
-    if hit:
-        text, source = hit
-        return TranscriptResult(text=text, source=f"cache:{source}", language="en")
-
-    # single-flight is assumed already present in your code; keep it.
-    _before_network_call(user_id, channel_id)
-    rate_limited = False
     try:
-        # call your existing fetch_captions(video_id) implementation (do not duplicate logic)
-        res = fetch_captions(video_id)
-        if res and res.text:
-            cache_set_persist(video_id, res.text, res.source, CACHE_DB_PATH)
-            _record_result(ok=True, rate_limited=False, user_id=user_id, channel_id=channel_id)
-            return res
-        _record_result(ok=False, rate_limited=False, user_id=user_id, channel_id=channel_id)
-        return None
-    except TranscriptError as e:
-        # if message indicates rate limiting, mark it
-        msg = str(e).lower()
-        rate_limited = ("rate limit" in msg) or ("429" in msg) or ("too many requests" in msg)
-        _record_result(ok=False, rate_limited=rate_limited, user_id=user_id, channel_id=channel_id)
-        raise
-    except RuntimeError as e:
-        # circuit-open
-        if "circuit-open" in str(e):
-            raise TranscriptError("Temporarily cooling down due to YouTube limits; please try later.")
-        raise
+        # persistent cache (fast path)
+        if tl:
+            with tl.span("persistent_cache_get"):
+                hit = cache_get_persist(video_id, PERSIST_TTL_SECS, CACHE_DB_PATH)
+        else:
+            hit = cache_get_persist(video_id, PERSIST_TTL_SECS, CACHE_DB_PATH)
+
+        if hit:
+            text, source = hit
+            return TranscriptResult(text=text, source=f"cache:{source}", language="en")
+
+        # single-flight is assumed already present in your code; keep it.
+        if tl:
+            with tl.span("before_network_call"):
+                _before_network_call(user_id, channel_id)
+        else:
+            _before_network_call(user_id, channel_id)
+
+        rate_limited = False
+        try:
+            # call your existing fetch_captions(video_id) implementation (do not duplicate logic)
+            if tl:
+                with tl.span("fetch_captions"):
+                    res = fetch_captions(video_id, tl=tl)
+            else:
+                res = fetch_captions(video_id)
+
+            if res and res.text:
+                if tl:
+                    with tl.span("persistent_cache_set"):
+                        cache_set_persist(video_id, res.text, res.source, CACHE_DB_PATH)
+                else:
+                    cache_set_persist(video_id, res.text, res.source, CACHE_DB_PATH)
+                _record_result(ok=True, rate_limited=False, user_id=user_id, channel_id=channel_id)
+                return res
+            _record_result(ok=False, rate_limited=False, user_id=user_id, channel_id=channel_id)
+            return None
+        except TranscriptError as e:
+            # if message indicates rate limiting, mark it
+            msg = str(e).lower()
+            rate_limited = ("rate limit" in msg) or ("429" in msg) or ("too many requests" in msg)
+            _record_result(ok=False, rate_limited=rate_limited, user_id=user_id, channel_id=channel_id)
+            raise
+        except RuntimeError as e:
+            # circuit-open
+            if "circuit-open" in str(e):
+                raise TranscriptError("Temporarily cooling down due to YouTube limits; please try later.")
+            raise
+    finally:
+        # Log metrics for monitoring
+        logger.debug("yt-metrics attempts=%s 429=%s negcache=%s directFirst=%s stdout=%s",
+                     _metrics["fetch_attempts"], _metrics["fetch_429"],
+                     _metrics["neg_cache_hits"], _metrics["direct_url_first_hits"],
+                     _metrics["stdout_hits"])
 
 
 def obtain_transcript(

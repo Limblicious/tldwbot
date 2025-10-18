@@ -1,23 +1,60 @@
-"""Transcript summarization utilities."""
+"""Transcript summarization with adaptive strategy and hierarchical processing."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import os
+import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
 from openai import OpenAI
 
+from bot.tokens import count_tokens
+from bot.stream_split import stream_split
+
+# Configuration from environment
+ONE_SHOT_ENABLED = os.getenv("ONE_SHOT_ENABLED", "1") in ("1", "true", "True")
+CONTEXT_TOKENS = int(os.getenv("CONTEXT_TOKENS", "128000"))  # gpt-4o-mini context
+PROMPT_TOKENS = int(os.getenv("PROMPT_TOKENS", "2500"))
+OUTPUT_TOKENS = int(os.getenv("OUTPUT_TOKENS", "2000"))
+SAFETY_TOKENS = int(os.getenv("SAFETY_TOKENS", "1000"))
+BUDGET = CONTEXT_TOKENS - PROMPT_TOKENS - OUTPUT_TOKENS - SAFETY_TOKENS
+
+MICRO_TOKENS = min(4096, BUDGET // 4)  # First pass chunk size
+MERGE_TOKENS = min(12000, BUDGET - 5000)  # Merge pass budget
+CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "3"))
+PER_CALL_TIMEOUT = int(os.getenv("PER_CALL_TIMEOUT_SEC", "60"))
+MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+MAX_TOTAL_RUNTIME_SEC = int(os.getenv("MAX_TOTAL_RUNTIME_SEC", "1800"))
+
+# Hard size caps so one embed always fits
+SUMMARY_CHAR_BUDGET = int(os.getenv("SUMMARY_CHAR_BUDGET", "3500"))  # final text budget
+SUMMARY_MAX_TOKENS = int(os.getenv("SUMMARY_MAX_TOKENS", "1100"))  # ~4 chars/token ≈ 4400 chars
+
 DEFAULT_PROMPT = """
 You are an expert analyst producing concise yet information-rich video summaries.
 Write the final answer using GitHub-flavored Markdown with the following sections in order:
-1. TL;DR — 2-3 sentence overview.
-2. Key Points — bulleted list of the most important insights.
-3. Timestamped Outline — ordered list of notable moments with timestamps where available.
-4. Notable Quotes — bullet list of memorable direct quotes.
-5. Action Items — bullet list of recommended follow-up actions.
-6. Caveats & Limitations — bullet list of uncertainties, limitations, or missing context.
-Each heading should be formatted as `## Heading`.
-If a section has no content, write `- None reported.` under that heading.
+1. TL;DW — 2-3 sentence overview.
+2. Key Points — bulleted list of the most important insights (this should be the longest section).
+3. Notable Quotes — bullet list of memorable direct quotes with timestamps in [MM:SS] format.
+4. Caveats & Limitations — bullet list of uncertainties, limitations, or missing context.
+""".strip()
+
+CHUNK_PROMPT = """
+Summarize this portion of a video transcript concisely. Extract key points, quotes, and insights.
+Keep the summary brief (max 300 words) while preserving important details.
+If you extract any quotes, include their timestamps in [MM:SS] format.
+""".strip()
+
+MERGE_PROMPT = """
+Combine these partial summaries into a single cohesive summary following the required format:
+1. TL;DW — 2-3 sentence overview
+2. Key Points — bulleted list
+3. Notable Quotes — bullet list with timestamps in [MM:SS] format
+4. Caveats & Limitations — bullet list
+
+Maintain all important facts, timestamps, and nuances while eliminating redundancy.
 """.strip()
 
 
@@ -27,131 +64,330 @@ class ChunkSummary:
     text: str
 
 
-def chunk_transcript(text: str, max_chars: int) -> List[str]:
-    if max_chars <= 0:
-        raise ValueError("max_chars must be greater than zero")
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-    chunks: List[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        # Try to break on sentence boundary
-        slice_text = text[start:end]
-        if end < len(text):
-            period_pos = slice_text.rfind(". ")
-            newline_pos = slice_text.rfind("\n")
-            split_pos = max(period_pos, newline_pos)
-            if split_pos != -1 and split_pos > max_chars // 2:
-                end = start + split_pos + 1
-                slice_text = text[start:end]
-        chunks.append(slice_text.strip())
-        start = end
-    return chunks
+def _enforce_char_budget(text: str, budget: int) -> str:
+    """Enforce character budget by truncating at paragraph boundary if needed."""
+    if len(text) <= budget:
+        return text
+    # Prefer cutting at a paragraph/bullet boundary
+    cut = text.rfind("\n", 0, budget)
+    if cut == -1:
+        cut = budget
+    return text[:cut].rstrip() + "\n\n*(condensed)*"
 
 
-def call_openai_summary(prompt: str, client: OpenAI, model: str) -> str:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant that strictly follows formatting instructions.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    return response.choices[0].message.content.strip()
+async def call_openai_with_retry(
+    prompt: str,
+    client: OpenAI,
+    model: str,
+    timeout: int = PER_CALL_TIMEOUT,
+    max_retries: int = MAX_RETRIES,
+    tl=None,
+    max_tokens: Optional[int] = None
+) -> str:
+    """Call OpenAI API with timeout and exponential backoff retry."""
+    for attempt in range(max_retries + 1):
+        try:
+            if tl:
+                with tl.span("openai_api_call", attempt=attempt):
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            client.chat.completions.create,
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": "You are a helpful assistant that strictly follows formatting instructions."},
+                                {"role": "user", "content": prompt},
+                            ],
+                            temperature=0.2,
+                            max_tokens=max_tokens,
+                        ),
+                        timeout=timeout
+                    )
+            else:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.chat.completions.create,
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": "You are a helpful assistant that strictly follows formatting instructions."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.2,
+                        max_tokens=max_tokens,
+                    ),
+                    timeout=timeout
+                )
+            return response.choices[0].message.content.strip()
+
+        except asyncio.TimeoutError:
+            if attempt < max_retries:
+                wait = (2 ** attempt) + (time.time() % 1)  # Exponential backoff with jitter
+                await asyncio.sleep(wait)
+                continue
+            raise RuntimeError(f"OpenAI API call timed out after {max_retries + 1} attempts")
+
+        except Exception as e:
+            if attempt < max_retries:
+                wait = (2 ** attempt) + (time.time() % 1)
+                await asyncio.sleep(wait)
+                continue
+            raise
 
 
-def summarize_chunk(
+async def summarize_chunk_async(
     chunk_text: str,
     *,
     chunk_index: int,
     total_chunks: int,
-    base_prompt: str,
     client: OpenAI,
     model: str,
+    tl=None,
 ) -> ChunkSummary:
+    """Summarize a single chunk asynchronously."""
     prompt = (
-        f"{base_prompt}\n\n"
-        f"Transcript chunk {chunk_index + 1} of {total_chunks}."
-        "\nFocus on accurately summarizing only this portion while preserving timestamps if present."
-        "\n\nTranscript:\n" + chunk_text
+        f"Transcript chunk {chunk_index + 1}.\n"
+        "Return ONLY compact bullets (≤5 bullets, ≤12 words each). No TL;DW. "
+        "Preserve any timestamps in [MM:SS] format for quotes.\n\n"
+        f"Transcript:\n{chunk_text}"
     )
-    summary_text = call_openai_summary(prompt, client, model)
+    summary_text = await call_openai_with_retry(
+        prompt, client, model, tl=tl,
+        max_tokens=max(256, SUMMARY_MAX_TOKENS // 4)
+    )
     return ChunkSummary(index=chunk_index, text=summary_text)
 
 
-def merge_summaries(
-    summaries: Iterable[ChunkSummary],
+async def merge_summaries_async(
+    summaries: List[ChunkSummary],
     *,
-    base_prompt: str,
     client: OpenAI,
     model: str,
+    is_final: bool = False,
+    tl=None,
 ) -> str:
+    """Merge multiple chunk summaries into one."""
     sorted_chunks = sorted(summaries, key=lambda s: s.index)
-    parts = "\n\n".join(
-        f"Chunk {chunk.index + 1} summary:\n{chunk.text}" for chunk in sorted_chunks
-    )
-    prompt = (
-        f"{base_prompt}\n\n"
-        "Combine the following partial summaries into a single cohesive summary."
-        " Maintain all important facts, timestamps, and nuances while eliminating redundancy."
-        " Ensure the final response follows the required section structure."
-        f"\n\nPartial summaries:\n{parts}"
-    )
-    return call_openai_summary(prompt, client, model)
+    parts = "\n\n".join(f"Part {chunk.index + 1}:\n{chunk.text}" for chunk in sorted_chunks)
+
+    if is_final:
+        prompt = (
+            f"Combine the partial summaries into one final summary.\n"
+            f"HARD OUTPUT LIMIT: <= {SUMMARY_CHAR_BUDGET} characters total. "
+            "TL;DW (2 sentences), Key Points (≤10 bullets, ≤15 words each - this should be most of the summary), "
+            "Notable Quotes (≤3 bullets with timestamps in [MM:SS] format), Caveats & Limitations (≤3 bullets). "
+            "No extra sections like Action Items.\n\n"
+            f"Partial summaries:\n{parts}"
+        )
+        merged = await call_openai_with_retry(prompt, client, model, tl=tl, max_tokens=SUMMARY_MAX_TOKENS)
+        return _enforce_char_budget(merged, SUMMARY_CHAR_BUDGET)
+    else:
+        prompt = f"Combine these summaries concisely:\n{parts}"
+        return await call_openai_with_retry(prompt, client, model, tl=tl)
 
 
+async def hierarchical_summarize(
+    transcript: str,
+    *,
+    client: OpenAI,
+    model: str,
+    tl=None,
+    progress_callback=None
+) -> str:
+    """
+    Hierarchical map-reduce summarization for very long transcripts.
+
+    Strategy:
+    1. Split transcript into micro chunks using streaming splitter
+    2. Summarize each chunk in parallel (with concurrency limit)
+    3. Group partial summaries and merge hierarchically
+    4. Final merge to produce structured output
+    """
+    start_time = time.time()
+
+    # Phase 1: Map - summarize micro chunks lazily
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    partials: List[ChunkSummary] = []
+    tasks = []
+    chunk_index = 0
+
+    async def summarize_with_limit(idx, chunk):
+        async with semaphore:
+            if progress_callback:
+                await progress_callback(f"Processing chunk {idx + 1}")
+            return await summarize_chunk_async(
+                chunk,
+                chunk_index=idx,
+                total_chunks=-1,  # Unknown until streaming completes
+                client=client,
+                model=model,
+                tl=tl
+            )
+
+    # Stream chunks and process them on-the-fly without materializing full list
+    for chunk in stream_split(transcript, model, MICRO_TOKENS, overlap_tokens=128):
+        # Yield control to event loop to prevent heartbeat blocking
+        await asyncio.sleep(0)
+
+        # Create task for this chunk
+        task = asyncio.create_task(summarize_with_limit(chunk_index, chunk))
+        tasks.append(task)
+        chunk_index += 1
+
+        # Process in batches to limit concurrent tasks
+        if len(tasks) >= CONCURRENCY:
+            batch_results = await asyncio.gather(*tasks)
+            partials.extend(batch_results)
+            tasks.clear()
+
+    # Process remaining tasks
+    if tasks:
+        batch_results = await asyncio.gather(*tasks)
+        partials.extend(batch_results)
+
+    total_chunks = chunk_index
+    if tl:
+        tl.set_metadata("total_chunks_pass1", total_chunks)
+
+    # Check runtime
+    elapsed = time.time() - start_time
+    if elapsed > MAX_TOTAL_RUNTIME_SEC:
+        # Return best-effort merge
+        return await merge_summaries_async(partials[:10], client=client, model=model, is_final=True, tl=tl) + \
+               "\n\n*(Partial summary due to time limit)*"
+
+    # Phase 2: Reduce hierarchically
+    current_level = partials
+    level = 0
+
+    while len(current_level) > 1:
+        level += 1
+        # Group summaries that fit in MERGE_TOKENS
+        # Estimate ~500 tokens per summary, group accordingly
+        group_size = max(1, MERGE_TOKENS // 1000)
+        groups = [current_level[i:i+group_size] for i in range(0, len(current_level), group_size)]
+
+        if tl:
+            tl.set_metadata(f"reduce_level_{level}_groups", len(groups))
+
+        if progress_callback:
+            await progress_callback(f"Merging summaries (level {level}, {len(groups)} groups)")
+
+        async def merge_group(group_idx, group):
+            async with semaphore:
+                merged_text = await merge_summaries_async(
+                    group,
+                    client=client,
+                    model=model,
+                    is_final=(len(groups) == 1),
+                    tl=tl
+                )
+                return ChunkSummary(index=group_idx, text=merged_text)
+
+        if tl:
+            with tl.span(f"reduce_phase_level_{level}", groups=len(groups)):
+                tasks = [merge_group(i, g) for i, g in enumerate(groups)]
+                current_level = await asyncio.gather(*tasks)
+        else:
+            tasks = [merge_group(i, g) for i, g in enumerate(groups)]
+            current_level = await asyncio.gather(*tasks)
+
+        # Check runtime again
+        elapsed = time.time() - start_time
+        if elapsed > MAX_TOTAL_RUNTIME_SEC:
+            result = current_level[0].text if current_level else "*(Processing interrupted)*"
+            return result + "\n\n*(Partial summary due to time limit)*"
+
+    # Final result
+    return current_level[0].text if current_level else ""
+
+
+async def summarize_transcript_async(
+    transcript: str,
+    *,
+    client: OpenAI,
+    model: str,
+    max_chars_per_chunk: int,  # Legacy parameter, ignored
+    tl=None,
+    progress_callback=None
+) -> str:
+    """
+    Adaptive summarization strategy:
+    - One-shot if transcript fits in context window
+    - Hierarchical map-reduce for very long transcripts
+    """
+    transcript = transcript.strip()
+
+    if not transcript:
+        raise ValueError("Transcript is empty")
+
+    # Count tokens
+    if tl:
+        with tl.span("count_tokens") as node:
+            transcript_tokens = count_tokens(model, transcript)
+            node.metadata["tokens"] = transcript_tokens
+    else:
+        transcript_tokens = count_tokens(model, transcript)
+
+    if tl:
+        tl.set_metadata("transcript_tokens", transcript_tokens)
+
+    # Strategy 1: One-shot if it fits
+    if ONE_SHOT_ENABLED and transcript_tokens <= BUDGET:
+        one_shot_prompt = (
+            f"{DEFAULT_PROMPT}\n\n"
+            f"HARD OUTPUT LIMIT: Respond in <= {SUMMARY_CHAR_BUDGET} characters total. "
+            f"Keep TL;DW (2 sentences), Key Points (≤10 bullets, ≤15 words each - this should be most of the summary), "
+            f"Notable Quotes (≤3 short bullets with timestamps in [MM:SS] format), Caveats & Limitations (≤3 bullets). "
+            f"No extra sections like Action Items.\n\n"
+            f"Transcript:\n{transcript}"
+        )
+        if tl:
+            with tl.span("one_shot_summarize"):
+                result = await call_openai_with_retry(one_shot_prompt, client, model, tl=tl, max_tokens=SUMMARY_MAX_TOKENS)
+        else:
+            result = await call_openai_with_retry(one_shot_prompt, client, model, tl=tl, max_tokens=SUMMARY_MAX_TOKENS)
+        return _enforce_char_budget(result, SUMMARY_CHAR_BUDGET)
+
+    # Strategy 2: Hierarchical map-reduce
+    if tl:
+        with tl.span("hierarchical_summarize"):
+            result = await hierarchical_summarize(
+                transcript,
+                client=client,
+                model=model,
+                tl=tl,
+                progress_callback=progress_callback
+            )
+    else:
+        result = await hierarchical_summarize(
+            transcript,
+            client=client,
+            model=model,
+            tl=tl,
+            progress_callback=progress_callback
+        )
+
+    return result
+
+
+# Backward compatibility: sync wrapper
 def summarize_transcript(
     transcript: str,
     *,
     client: OpenAI,
     model: str,
     max_chars_per_chunk: int,
+    tl=None,
 ) -> str:
-    base_prompt = DEFAULT_PROMPT.strip()
-    chunks = chunk_transcript(transcript, max_chars_per_chunk)
-    if not chunks:
-        raise ValueError("Transcript is empty")
-
-    if len(chunks) == 1:
-        return summarize_chunk(
-            chunks[0],
-            chunk_index=0,
-            total_chunks=1,
-            base_prompt=base_prompt,
-            client=client,
-            model=model,
-        ).text
-
-    partials = [
-        summarize_chunk(
-            chunk,
-            chunk_index=i,
-            total_chunks=len(chunks),
-            base_prompt=base_prompt,
-            client=client,
-            model=model,
-        )
-        for i, chunk in enumerate(chunks)
-    ]
-    return merge_summaries(
-        partials,
-        base_prompt=base_prompt,
+    """Synchronous wrapper for backward compatibility."""
+    return asyncio.run(summarize_transcript_async(
+        transcript,
         client=client,
         model=model,
-    )
+        max_chars_per_chunk=max_chars_per_chunk,
+        tl=tl
+    ))
 
 
-def compute_summary_cache_key(
-    *, video_id: str, prompt: str, model: str
-) -> str:
+def compute_summary_cache_key(*, video_id: str, prompt: str, model: str) -> str:
     payload = f"{video_id}:{model}:{prompt.strip()}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
