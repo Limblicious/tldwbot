@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from .storage import Storage
-from .summarize import compute_summary_cache_key, summarize_transcript, DEFAULT_PROMPT
+from .summarize import compute_summary_cache_key, summarize_transcript, summarize_transcript_async, DEFAULT_PROMPT
 from .transcripts import TranscriptError, extract_video_id, obtain_transcript, guarded_fetch_captions
 
 logging.basicConfig(level=logging.INFO)
@@ -33,13 +33,6 @@ _DEDUP_TTL = 600  # 10 minutes
 _worker_semaphore = asyncio.Semaphore(2)
 
 
-def getenv_bool(key: str, default: bool = False) -> bool:
-    value = os.getenv(key)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 class SummaryBot(commands.Bot):
     def __init__(
         self,
@@ -48,8 +41,6 @@ class SummaryBot(commands.Bot):
         openai_api_key: str,
         summary_model: str,
         db_path: str,
-        use_local_whisper: bool,
-        whisper_model_size: str,
         max_chars_per_chunk: int,
         max_discord_chars: int,
     ) -> None:
@@ -58,8 +49,6 @@ class SummaryBot(commands.Bot):
         self.discord_token = discord_token
         self.summary_model = summary_model
         self.storage = Storage(db_path)
-        self.use_local_whisper = use_local_whisper
-        self.whisper_model_size = whisper_model_size
         self.max_chars_per_chunk = max_chars_per_chunk
         self.max_discord_chars = max_discord_chars
         self.openai_client = OpenAI(api_key=openai_api_key)
@@ -76,12 +65,11 @@ async def summarize_command(
     url: str,
     bot: SummaryBot,
 ) -> None:
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    await interaction.response.defer(thinking=True, ephemeral=False)
     video_id = extract_video_id(url)
     if not video_id:
-        await interaction.followup.send(
-            "❌ Unable to determine YouTube video ID. Please provide a valid URL or ID.",
-            ephemeral=True,
+        await interaction.edit_original_response(
+            content="❌ Unable to determine YouTube video ID. Please provide a valid URL or ID."
         )
         return
 
@@ -98,9 +86,8 @@ async def summarize_command(
             del _recent_requests[k]
 
         if dedup_key in _recent_requests:
-            await interaction.followup.send(
-                "⏭️ This video is already being processed.",
-                ephemeral=True,
+            await interaction.edit_original_response(
+                content="⏭️ This video is already being processed."
             )
             return
         _recent_requests[dedup_key] = now
@@ -121,6 +108,11 @@ async def summarize_command(
             transcript_source = transcript_result.source if transcript_result else "unknown"
             logger.info("Summary cache hit for %s", video_id)
         else:
+            # Update status: fetching captions
+            await interaction.edit_original_response(
+                content="⏳ Fetching captions..."
+            )
+
             try:
                 transcript_result = await asyncio.to_thread(
                     guarded_fetch_captions,
@@ -129,22 +121,19 @@ async def summarize_command(
                     channel_id=channel_id,
                 )
                 if not transcript_result:
-                    await interaction.followup.send(
-                        "❌ No captions available for this video.",
-                        ephemeral=True,
+                    await interaction.edit_original_response(
+                        content="❌ No captions available for this video."
                     )
                     return
             except TranscriptError as exc:
                 msg = str(exc)
                 if "quota exceeded" in msg.lower() or "cooling down" in msg.lower():
-                    await interaction.followup.send(
-                        f"⏸️ {exc}",
-                        ephemeral=True,
+                    await interaction.edit_original_response(
+                        content=f"⏸️ {exc}"
                     )
                 else:
-                    await interaction.followup.send(
-                        f"❌ Failed to obtain transcript: {exc}",
-                        ephemeral=True,
+                    await interaction.edit_original_response(
+                        content=f"❌ Failed to obtain transcript: {exc}"
                     )
                 return
 
@@ -152,19 +141,38 @@ async def summarize_command(
             bot.storage.upsert_transcript(video_id, transcript_result.source, transcript_result.text)
 
             transcript_source = transcript_result.source
+
+            # Create progress callback to update Discord message
+            last_update_time = [0.0]  # mutable container for closure
+
+            async def progress_callback(message: str):
+                """Update Discord message with progress, rate-limited to avoid API spam."""
+                import time
+                now = time.time()
+                # Rate limit: only update every 5 seconds
+                if now - last_update_time[0] >= 5.0:
+                    try:
+                        await interaction.edit_original_response(
+                            content=f"⏳ {message}..."
+                        )
+                        last_update_time[0] = now
+                    except Exception:
+                        # Ignore errors during progress updates
+                        pass
+
             try:
-                summary_text = await asyncio.to_thread(
-                    summarize_transcript,
+                # Use async version with progress callback
+                summary_text = await summarize_transcript_async(
                     transcript_result.text,
                     client=bot.openai_client,
                     model=bot.summary_model,
                     max_chars_per_chunk=bot.max_chars_per_chunk,
+                    progress_callback=progress_callback,
                 )
             except Exception as exc:  # pragma: no cover
                 logger.exception("Summarization failed for %s", video_id)
-                await interaction.followup.send(
-                    f"❌ Summarization failed: {exc}",
-                    ephemeral=True,
+                await interaction.edit_original_response(
+                    content=f"❌ Summarization failed: {exc}"
                 )
                 return
 
@@ -179,67 +187,35 @@ async def summarize_command(
         )
 
 
-def split_for_discord(text: str, limit: int) -> list[str]:
-    if limit <= 0:
-        raise ValueError("limit must be positive")
-    chunks: list[str] = []
-    remaining = text.strip()
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-        split_point = remaining.rfind("\n", 0, limit)
-        if split_point == -1:
-            split_point = remaining.rfind(" ", 0, limit)
-        if split_point == -1:
-            split_point = limit
-        chunks.append(remaining[:split_point].strip())
-        remaining = remaining[split_point:].strip()
-    return chunks
-
-
 async def send_summary_response(
     interaction: discord.Interaction,
     *,
     video_id: str,
     transcript_source: str,
     summary_text: str,
-    max_discord_chars: int,
+    max_discord_chars: int,  # kept for signature compatibility; not used
 ) -> None:
-    header = f"**Video ID:** `{video_id}`\n**Transcript source:** {transcript_source}"
-    per_message_limit = min(2000, max_discord_chars)
-    messages = split_for_discord(summary_text, per_message_limit)
-    if not messages:
-        messages = ["(empty summary)"]
+    """Send a single public message with one embed, no attachments."""
+    # Discord limits
+    EMBED_TITLE_MAX = 256
+    EMBED_DESC_MAX = 4096
+    EMBED_TOTAL_MAX = 6000
 
-    files = []
-    if len(summary_text) > max_discord_chars:
-        file_buffer = io.BytesIO(summary_text.encode("utf-8"))
-        file_buffer.seek(0)
-        files.append(discord.File(file_buffer, filename=f"{video_id}_summary.txt"))
+    title = "Video Summary"[:EMBED_TITLE_MAX]
+    header = f"**Video ID:** `{video_id}` · **Transcript source:** {transcript_source}"
 
-    first_body = messages[0]
-    extra_chunks = messages[1:]
-    if len(header) + 2 + len(first_body) > per_message_limit:
-        allowed = max(0, per_message_limit - len(header) - 2)
-        if allowed > 0:
-            overflow = first_body[allowed:].strip()
-            first_body = first_body[:allowed].rstrip()
-        else:
-            overflow = first_body
-            first_body = ""
-        combined = []
-        if overflow:
-            combined.append(overflow)
-        combined.extend(extra_chunks)
-        extra_text = "\n".join(filter(None, combined))
-        extra_chunks = split_for_discord(extra_text, per_message_limit) if extra_text else []
+    # Single embed; compute safe description cap so total <= 6000
+    # leave ~80 chars slack for internals/formatting
+    max_desc_by_total = max(0, min(EMBED_DESC_MAX, EMBED_TOTAL_MAX - len(title) - 80))
+    desc = summary_text[:max_desc_by_total]
 
-    first_content = f"{header}\n\n{first_body}" if first_body else header
-    await interaction.followup.send(first_content, files=files if files else None)
+    embed = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
 
-    for chunk in extra_chunks:
-        await interaction.followup.send(chunk[:per_message_limit])
+    await interaction.edit_original_response(
+        content=header,   # tiny; under 2k
+        embeds=[embed],   # exactly one embed
+        attachments=[]    # never attach files
+    )
 
 
 def main() -> None:
@@ -254,8 +230,6 @@ def main() -> None:
 
     summary_model = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4.1-mini")
     db_path = os.getenv("CACHE_DB", "cache.sqlite3")
-    use_local_whisper = getenv_bool("USE_LOCAL_WHISPER", True)
-    whisper_model_size = os.getenv("WHISPER_MODEL_SIZE", "medium")
     max_chars_per_chunk = int(os.getenv("MAX_CHARS_PER_CHUNK", "4000"))
     max_discord_chars = int(os.getenv("MAX_DISCORD_MSG_CHARS", "1900"))
 
@@ -264,8 +238,6 @@ def main() -> None:
         openai_api_key=openai_api_key,
         summary_model=summary_model,
         db_path=db_path,
-        use_local_whisper=use_local_whisper,
-        whisper_model_size=whisper_model_size,
         max_chars_per_chunk=max_chars_per_chunk,
         max_discord_chars=max_discord_chars,
     )

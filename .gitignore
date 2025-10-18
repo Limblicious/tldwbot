@@ -50,3 +50,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Subtitle files (should never be written, but ignore if present)
+*.vtt
