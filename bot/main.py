@@ -33,13 +33,6 @@ _DEDUP_TTL = 600  # 10 minutes
 _worker_semaphore = asyncio.Semaphore(2)
 
 
-def getenv_bool(key: str, default: bool = False) -> bool:
-    value = os.getenv(key)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 class SummaryBot(commands.Bot):
     def __init__(
         self,
@@ -48,8 +41,6 @@ class SummaryBot(commands.Bot):
         openai_api_key: str,
         summary_model: str,
         db_path: str,
-        use_local_whisper: bool,
-        whisper_model_size: str,
         max_chars_per_chunk: int,
         max_discord_chars: int,
     ) -> None:
@@ -58,8 +49,6 @@ class SummaryBot(commands.Bot):
         self.discord_token = discord_token
         self.summary_model = summary_model
         self.storage = Storage(db_path)
-        self.use_local_whisper = use_local_whisper
-        self.whisper_model_size = whisper_model_size
         self.max_chars_per_chunk = max_chars_per_chunk
         self.max_discord_chars = max_discord_chars
         self.openai_client = OpenAI(api_key=openai_api_key)
@@ -254,8 +243,6 @@ def main() -> None:
 
     summary_model = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4.1-mini")
     db_path = os.getenv("CACHE_DB", "cache.sqlite3")
-    use_local_whisper = getenv_bool("USE_LOCAL_WHISPER", True)
-    whisper_model_size = os.getenv("WHISPER_MODEL_SIZE", "medium")
     max_chars_per_chunk = int(os.getenv("MAX_CHARS_PER_CHUNK", "4000"))
     max_discord_chars = int(os.getenv("MAX_DISCORD_MSG_CHARS", "1900"))
 
@@ -264,8 +251,6 @@ def main() -> None:
         openai_api_key=openai_api_key,
         summary_model=summary_model,
         db_path=db_path,
-        use_local_whisper=use_local_whisper,
-        whisper_model_size=whisper_model_size,
         max_chars_per_chunk=max_chars_per_chunk,
         max_discord_chars=max_discord_chars,
     )

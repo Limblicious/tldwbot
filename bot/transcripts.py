@@ -513,10 +513,6 @@ def guarded_fetch_captions(video_id: str, user_id: str | int | None = None, chan
 def obtain_transcript(
     storage: Storage,
     video_id: str,
-    *,
-    use_local_whisper: bool = False,
-    whisper_model_size: str = "",
-    openai_client: Optional[object] = None,
 ) -> TranscriptResult:
     """
     Obtain transcript for a YouTube video.
