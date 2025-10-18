@@ -6,11 +6,20 @@ A production-ready Discord bot that turns any YouTube video into a structured, a
 
 - `/summarize` slash command accepts a YouTube URL or video ID.
 - Transcript acquisition pipeline (captions-only, no audio download):
-  1. YouTube captions via [`youtube-transcript-api`](https://pypi.org/project/youtube-transcript-api/) (manual → auto-generated → translated)
-  2. Direct subtitle extraction via [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) (fallback for subtitle parsing)
-- Structured Markdown summaries with TL;DR, key points, timestamped outline, notable quotes, action items, and caveats.
-- Automatic chunking for long transcripts and final merge summarization.
-- SQLite caching for transcripts and summaries.
+  1. Direct subtitle extraction via [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) (primary method)
+  2. YouTube captions via [`youtube-transcript-api`](https://pypi.org/project/youtube-transcript-api/) (manual → auto-generated → translated) - currently disabled due to XML parsing issues
+- **Timestamp preservation**: Transcripts maintain VTT timestamps in `[MM:SS]` format for quote attribution.
+- Structured Markdown summaries with:
+  - **TL;DW** — 2-3 sentence overview
+  - **Key Points** — bulleted list of important insights
+  - **Notable Quotes** — memorable quotes with timestamps in `[MM:SS]` format
+  - **Caveats & Limitations** — uncertainties or missing context
+- **Adaptive summarization strategy**:
+  - One-shot summarization for short videos (fits in context window)
+  - Hierarchical map-reduce for long videos with streaming chunk processing
+- Advanced rate limiting and quota management to prevent YouTube API abuse.
+- Persistent SQLite caching for transcripts and summaries with configurable TTL.
+- Circuit breaker pattern for handling YouTube 429 rate limits.
 - Discord-safe message splitting with automatic `.txt` attachments for long outputs.
 - Docker-ready deployment with ffmpeg and all dependencies.
 
@@ -21,11 +30,19 @@ bot/
 ├── __init__.py
 ├── main.py           # Discord bot + slash command orchestration
 ├── storage.py        # Thread-safe SQLite cache wrapper
-├── summarize.py      # Transcript chunking & OpenAI-powered summarization
-└── transcripts.py    # Transcript acquisition pipeline & fallbacks
+├── summarize.py      # Adaptive summarization with hierarchical map-reduce
+├── transcripts.py    # Transcript acquisition pipeline with rate limiting
+├── tokens.py         # Token counting utilities (tiktoken-based)
+├── stream_split.py   # Streaming text chunking for large transcripts
+├── limiters.py       # Rate limiting, quotas, and circuit breaker
+├── cache_sqlite.py   # Persistent SQLite cache with TTL
+├── timetest.py       # Performance profiling utilities (dev only)
+└── time_run.py       # Benchmarking script (dev only)
 requirements.txt
 Dockerfile
+docker-compose.yml
 .env.example
+CLAUDE.md             # Development guardrails
 README.md
 ```
 
@@ -45,18 +62,40 @@ cp .env.example .env
 
 | Variable | Description |
 | --- | --- |
-| `DISCORD_BOT_TOKEN` | Discord bot token (required) |
-| `OPENAI_API_KEY` | OpenAI API key for summarization (required) |
-| `OPENAI_SUMMARY_MODEL` | Chat model for summarization (default `gpt-4.1-mini`) |
-| `CACHE_DB` | SQLite database path (default `cache.sqlite3`) |
-| `MAX_CHARS_PER_CHUNK` | Max characters per transcript chunk before summarization (default `12000`) |
-| `MAX_DISCORD_MSG_CHARS` | Max characters per Discord message chunk (default `1900`) |
+| **Required** | |
+| `DISCORD_BOT_TOKEN` | Discord bot token |
+| `OPENAI_API_KEY` | OpenAI API key for summarization |
+| **Summarization** | |
+| `OPENAI_SUMMARY_MODEL` | Chat model for summarization (default `gpt-4o-mini`) |
+| `ONE_SHOT_ENABLED` | Enable one-shot summarization for short videos (default `1`) |
+| `CONTEXT_TOKENS` | LLM context window size (default `128000`) |
+| `SUMMARY_CHAR_BUDGET` | Max summary character budget (default `3500`) |
+| `SUMMARY_MAX_TOKENS` | Max tokens for summary generation (default `1100`) |
+| `LLM_CONCURRENCY` | Concurrent LLM calls during chunking (default `3`) |
+| **Caching** | |
+| `CACHE_DB` | SQLite database path for legacy storage (default `cache.sqlite3`) |
+| `CACHE_DB_PATH` | Persistent transcript cache path (default `/app/cache.db`) |
+| `PERSIST_TTL_SECS` | Persistent cache TTL in seconds (default `86400`) |
+| `YT_CACHE_TTL` | YouTube transcript cache TTL in seconds (default `7200`) |
+| **YouTube API** | |
 | `YT_COOKIES` | Optional path to YouTube cookies.txt for age-restricted videos |
 | `YT_FORCE_IPV4` | Force IPv4 for YouTube requests (default `1`) |
-| `RATE_RPS` | Rate limit: requests per second (default `1.0`) |
+| `YT_UA` | User-Agent string for YouTube requests |
+| `YT_REQ_SLEEP` | Seconds between external YouTube requests (default `0`) |
+| **Rate Limiting** | |
+| `RATE_RPS` | Token bucket: requests per second (default `1.0`) |
+| `RATE_BURST` | Token bucket: burst size (default `2`) |
 | `USER_QUOTA_MAX` | Per-user quota: max videos per window (default `5`) |
+| `USER_QUOTA_WINDOW` | Per-user quota window in seconds (default `600`) |
 | `CHAN_QUOTA_MAX` | Per-channel quota: max videos per window (default `20`) |
-| `CACHE_DB_PATH` | Persistent transcript cache path (default `/app/cache.db`) |
+| `CHAN_QUOTA_WINDOW` | Per-channel quota window in seconds (default `600`) |
+| **Circuit Breaker** | |
+| `CB_429_THRESHOLD` | Consecutive 429s to open circuit breaker (default `3`) |
+| `CB_OPEN_SECS` | Circuit breaker open duration in seconds (default `1800`) |
+| `CB_HALF_PROBE_SECS` | Half-open probe delay in seconds (default `120`) |
+| `NEG_CACHE_TTL` | Per-video cooldown after 429 in seconds (default `3600`) |
+| **Discord** | |
+| `MAX_DISCORD_MSG_CHARS` | Max characters per Discord message chunk (default `1900`) |
 
 ## Local Development
 
@@ -116,12 +155,30 @@ docker run \
 - **transcripts**: `video_id`, `source`, `text`, `created_at`
 - **summaries**: `video_id`, `prompt_hash`, `model`, `summary`, `created_at`
 
+## Performance Features
+
+- **Streaming chunk processing**: Uses `stream_split.py` to process large transcripts without loading the entire text into memory
+- **Hierarchical map-reduce**: Breaks down very long videos into chunks, summarizes each in parallel, then merges hierarchically
+- **Token counting**: Accurate token counting with `tiktoken` (with character-based fallback)
+- **Concurrent LLM calls**: Configurable concurrency for parallel chunk summarization
+- **Persistent caching**: SQLite-based caching with TTL to avoid redundant API calls
+
+## Rate Limiting & Protection
+
+- **Token bucket rate limiter**: Smooth out request bursts to YouTube
+- **Per-user and per-channel quotas**: Prevent individual users or channels from overwhelming the bot
+- **Circuit breaker for 429s**: Automatically backs off when YouTube rate limits are hit
+- **Negative caching**: Per-video cooldown after rate limit errors
+- **Stable jitter**: Deterministic jitter based on video ID to spread out requests
+
 ## Notes
 
-- The bot only fetches YouTube captions; it does not download audio or use Whisper transcription.
-- If a video has no captions, the bot will return an error message.
-- The bot automatically labels the transcript source in responses (e.g., `yt-api-manual`, `yt-dlp`).
+- The bot **only** fetches YouTube captions; it does not download audio or use Whisper transcription.
+- If a video has no captions, the bot will return an error message: "No captions available for this video."
+- The bot automatically labels the transcript source in responses (e.g., `cache:yt-dlp`, `yt-dlp`).
+- **Timestamps are preserved** from VTT captions and included in notable quotes as `[MM:SS]` format.
 - Large summaries are attached as `.txt` files for convenience.
-- Rate limiting and quotas prevent YouTube API abuse (configurable via environment variables).
+- Rate limiting and quotas prevent YouTube API abuse (all configurable via environment variables).
 - Ensure your Discord bot has the `Message Content Intent` if you plan to extend functionality beyond slash commands.
+- See `CLAUDE.md` for development guardrails and best practices.
 
