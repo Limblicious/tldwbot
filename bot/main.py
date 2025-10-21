@@ -9,6 +9,7 @@ os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 import asyncio
 import io
 import logging
+from datetime import datetime
 from typing import Optional
 
 import discord
@@ -349,6 +350,9 @@ async def _handle_short_video(
     async with _queue_lock:
         _short_queue_count += 1
 
+    user_id = interaction.user.id
+    channel = interaction.channel
+
     try:
         queue_status = get_queue_status()
         await interaction.edit_original_response(
@@ -358,9 +362,12 @@ async def _handle_short_video(
         # Wait for slot in short queue
         async with _short_queue_semaphore:
             queue_status = get_queue_status()
-            await interaction.edit_original_response(
-                content=f"⏳ Processing now (short queue)...\n\n📊 Queue Status: {queue_status}"
-            )
+            try:
+                await interaction.edit_original_response(
+                    content=f"⏳ Processing now (short queue)...\n\n📊 Queue Status: {queue_status}"
+                )
+            except discord.errors.HTTPException as e:
+                logger.warning("Could not update interaction (might be expired): %s", e)
 
             # Process the video
             summary_text = await _summarize_video(
@@ -373,16 +380,29 @@ async def _handle_short_video(
                 is_long_video=False
             )
 
-            # Send response via interaction
+            # Send response via interaction (with fallback to channel if expired)
             queue_status = get_queue_status()
-            await send_summary_response(
-                interaction,
-                video_id=video_id,
-                transcript_source=transcript_result.source,
-                summary_text=summary_text,
-                max_discord_chars=bot.max_discord_chars,
-                queue_status=queue_status,
-            )
+            try:
+                await send_summary_response(
+                    interaction,
+                    video_id=video_id,
+                    transcript_source=transcript_result.source,
+                    summary_text=summary_text,
+                    max_discord_chars=bot.max_discord_chars,
+                    queue_status=queue_status,
+                )
+            except discord.errors.HTTPException as e:
+                # Interaction expired - fall back to channel.send()
+                logger.warning("Interaction expired, falling back to channel.send(): %s", e)
+                if channel:
+                    await _send_summary_to_channel(
+                        channel,
+                        user_id,
+                        video_id,
+                        transcript_result.source,
+                        summary_text,
+                        queue_status
+                    )
     finally:
         # Decrement queue count
         async with _queue_lock:
@@ -448,46 +468,130 @@ async def _handle_long_video(
     async with _queue_lock:
         _long_queue_count += 1
 
+    # Create job record
+    bot.storage.create_job(
+        video_id=video_id,
+        user_id=user_id,
+        channel_id=channel_id,
+        estimated_time_sec=estimated_time_sec,
+        progress="Queued for long video processing"
+    )
+
     # Store channel and user for later ping
     channel = interaction.channel
 
+    # Create webhook for long-lived communication (bypasses 15-min interaction limit)
+    webhook = None
     try:
+        # Try to get or create a webhook for the bot
+        if channel and hasattr(channel, 'webhooks'):
+            webhooks = await channel.webhooks()
+            webhook = discord.utils.get(webhooks, name='tldwbot-processor')
+            if not webhook:
+                try:
+                    webhook = await channel.create_webhook(name='tldwbot-processor')
+                except discord.Forbidden:
+                    logger.warning("Cannot create webhook, will use channel.send() fallback")
+    except Exception as e:
+        logger.warning("Webhook creation failed: %s, using channel.send() fallback", e)
+
+    try:
+        # Update via interaction one last time before it expires
         queue_status = get_queue_status()
-        await interaction.edit_original_response(
-            content=f"✅ Confirmed! Entering long video queue...\n\n📊 Queue Status: {queue_status}",
-            view=None
-        )
+        try:
+            await interaction.edit_original_response(
+                content=f"✅ Confirmed! Entering long video queue...\n\n📊 Queue Status: {queue_status}",
+                view=None
+            )
+        except discord.errors.HTTPException as e:
+            # Interaction already expired, that's okay
+            logger.warning("Could not update interaction: %s", e)
 
         # Wait for slot in long queue
         async with _long_queue_semaphore:
-            queue_status = get_queue_status()
-            if channel:
-                await channel.send(
-                    f"<@{user_id}> 🎬 Now processing your long video: `{video_id}`\n\n📊 Queue Status: {queue_status}"
-                )
-
-            # Process the video
-            summary_text = await _summarize_video(
-                None,  # No interaction updates for long videos
-                video_id,
-                bot,
-                transcript_result,
-                transcript_tokens,
-                estimated_time_sec,
-                is_long_video=True
+            # Update job status
+            bot.storage.update_job_status(
+                video_id=video_id,
+                status="processing",
+                progress="Processing started",
+                started_at=datetime.utcnow()
             )
 
-            # Send result via channel.send() to bypass 15-min interaction limit
             queue_status = get_queue_status()
-            if channel:
-                await _send_summary_to_channel(
-                    channel,
-                    user_id,
+
+            # Send status update via webhook or channel
+            status_msg = f"<@{user_id}> 🎬 Now processing your long video: `{video_id}`\n\n📊 Queue Status: {queue_status}"
+            if webhook:
+                try:
+                    await webhook.send(content=status_msg, username="tldwbot")
+                except Exception as e:
+                    logger.warning("Webhook send failed: %s, using channel.send()", e)
+                    if channel:
+                        await channel.send(status_msg)
+            elif channel:
+                await channel.send(status_msg)
+
+            # Process the video
+            try:
+                summary_text = await _summarize_video(
+                    None,  # No interaction updates for long videos
                     video_id,
-                    transcript_result.source,
-                    summary_text,
-                    queue_status
+                    bot,
+                    transcript_result,
+                    transcript_tokens,
+                    estimated_time_sec,
+                    is_long_video=True
                 )
+
+                # Update job status
+                bot.storage.update_job_status(
+                    video_id=video_id,
+                    status="completed",
+                    progress="Summary complete",
+                    completed_at=datetime.utcnow()
+                )
+
+                # Send result via webhook/channel to bypass 15-min interaction limit
+                queue_status = get_queue_status()
+                if webhook:
+                    try:
+                        await _send_summary_via_webhook(
+                            webhook,
+                            user_id,
+                            video_id,
+                            transcript_result.source,
+                            summary_text,
+                            queue_status
+                        )
+                    except Exception as e:
+                        logger.warning("Webhook summary send failed: %s, using channel.send()", e)
+                        if channel:
+                            await _send_summary_to_channel(
+                                channel,
+                                user_id,
+                                video_id,
+                                transcript_result.source,
+                                summary_text,
+                                queue_status
+                            )
+                elif channel:
+                    await _send_summary_to_channel(
+                        channel,
+                        user_id,
+                        video_id,
+                        transcript_result.source,
+                        summary_text,
+                        queue_status
+                    )
+            except Exception as e:
+                # Mark job as failed
+                bot.storage.update_job_status(
+                    video_id=video_id,
+                    status="failed",
+                    progress=f"Error: {str(e)[:100]}",
+                    completed_at=datetime.utcnow()
+                )
+                raise
     finally:
         # Decrement queue count
         async with _queue_lock:
@@ -573,6 +677,35 @@ async def _summarize_video(
     bot.storage.upsert_summary(video_id, prompt_hash, bot.summary_model, summary_text)
 
     return summary_text
+
+
+async def _send_summary_via_webhook(
+    webhook: discord.Webhook,
+    user_id: int,
+    video_id: str,
+    transcript_source: str,
+    summary_text: str,
+    queue_status: str
+) -> None:
+    """Send summary via webhook for long videos (bypasses interaction timeout)."""
+    EMBED_TITLE_MAX = 256
+    EMBED_DESC_MAX = 4096
+    EMBED_TOTAL_MAX = 6000
+
+    title = "Video Summary (Long Video)"[:EMBED_TITLE_MAX]
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    header = (
+        f"<@{user_id}> ✅ **Summary Complete!**\n"
+        f"**Video:** {video_url} · **Transcript source:** {transcript_source}\n\n"
+        f"📊 Queue Status: {queue_status}"
+    )
+
+    max_desc_by_total = max(0, min(EMBED_DESC_MAX, EMBED_TOTAL_MAX - len(title) - 80))
+    desc = summary_text[:max_desc_by_total]
+
+    embed = discord.Embed(title=title, description=desc, color=discord.Color.green())
+
+    await webhook.send(content=header, embed=embed, username="tldwbot")
 
 
 async def _send_summary_to_channel(
@@ -674,6 +807,69 @@ def main() -> None:
             url,
             bot,
         )
+
+    @bot.tree.command(name="status", description="Check the current queue status")
+    async def status(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        short_processing = SHORT_QUEUE_LIMIT - _short_queue_semaphore._value
+        short_waiting = _short_queue_count - short_processing
+        long_processing = LONG_QUEUE_LIMIT - _long_queue_semaphore._value
+        long_waiting = _long_queue_count - long_processing
+
+        embed = discord.Embed(title="📊 Queue Status", color=discord.Color.blue())
+        embed.add_field(
+            name="Short Queue (≤10 minutes)",
+            value=f"Processing: {short_processing}/{SHORT_QUEUE_LIMIT}\nWaiting: {short_waiting}",
+            inline=True
+        )
+        embed.add_field(
+            name="Long Queue (>10 minutes)",
+            value=f"Processing: {long_processing}/{LONG_QUEUE_LIMIT}\nWaiting: {long_waiting}",
+            inline=True
+        )
+
+        await interaction.edit_original_response(content=None, embed=embed)
+
+    @bot.tree.command(name="myjobs", description="Check your recent summarization jobs")
+    async def myjobs(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        user_id = interaction.user.id
+        jobs = bot.storage.get_user_jobs(user_id, limit=5)
+
+        if not jobs:
+            await interaction.edit_original_response(
+                content="You don't have any recent jobs."
+            )
+            return
+
+        embed = discord.Embed(title="📋 Your Recent Jobs", color=discord.Color.blue())
+
+        for job in jobs:
+            status_emoji = {
+                "queued": "⏳",
+                "processing": "▶️",
+                "completed": "✅",
+                "failed": "❌"
+            }.get(job.status, "❓")
+
+            video_url = f"https://www.youtube.com/watch?v={job.video_id}"
+            field_value = f"{status_emoji} **Status:** {job.status.capitalize()}\n"
+            field_value += f"**Progress:** {job.progress}\n"
+            field_value += f"**Video:** [Link]({video_url})\n"
+
+            if job.started_at:
+                elapsed = (datetime.utcnow() - job.started_at).total_seconds()
+                field_value += f"**Running for:** {int(elapsed)}s\n"
+
+            embed.add_field(
+                name=f"Job: {job.video_id[:11]}...",
+                value=field_value,
+                inline=False
+            )
+
+        await interaction.edit_original_response(content=None, embed=embed)
 
     bot.run_bot()
 

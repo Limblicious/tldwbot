@@ -35,6 +35,19 @@ class PerformanceMetric:
     created_at: datetime
 
 
+@dataclass
+class JobRecord:
+    video_id: str
+    user_id: int
+    channel_id: int
+    status: str  # "queued", "processing", "completed", "failed"
+    progress: str  # Human-readable progress message
+    estimated_time_sec: float
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    created_at: datetime
+
+
 class Storage:
     """Thread-safe SQLite wrapper for caching transcripts and summaries."""
 
@@ -85,6 +98,28 @@ class Storage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_perf_strategy_tokens
                 ON performance_metrics(strategy, transcript_tokens)
+                """
+            )
+            # Job tracking table
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    video_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    progress TEXT NOT NULL,
+                    estimated_time_sec REAL NOT NULL,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_jobs_user_status
+                ON jobs(user_id, status)
                 """
             )
 
@@ -226,4 +261,107 @@ class Storage:
 
             # Add 20% buffer for variance
             return estimated_time * 1.2
+
+    def create_job(
+        self,
+        video_id: str,
+        user_id: int,
+        channel_id: int,
+        estimated_time_sec: float,
+        progress: str = "Queued"
+    ) -> None:
+        """Create a new job record."""
+        with self._lock, self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs (video_id, user_id, channel_id, status, progress, estimated_time_sec, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET
+                    status='queued',
+                    progress=excluded.progress,
+                    estimated_time_sec=excluded.estimated_time_sec,
+                    created_at=excluded.created_at
+                """,
+                (video_id, user_id, channel_id, "queued", progress, estimated_time_sec, datetime.utcnow().isoformat()),
+            )
+
+    def update_job_status(
+        self,
+        video_id: str,
+        status: str,
+        progress: str,
+        started_at: Optional[datetime] = None,
+        completed_at: Optional[datetime] = None
+    ) -> None:
+        """Update job status and progress."""
+        with self._lock, self._get_conn() as conn:
+            if started_at and completed_at:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status=?, progress=?, started_at=?, completed_at=?
+                    WHERE video_id=?
+                    """,
+                    (status, progress, started_at.isoformat(), completed_at.isoformat(), video_id),
+                )
+            elif started_at:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status=?, progress=?, started_at=?
+                    WHERE video_id=?
+                    """,
+                    (status, progress, started_at.isoformat(), video_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status=?, progress=?
+                    WHERE video_id=?
+                    """,
+                    (status, progress, video_id),
+                )
+
+    def get_user_jobs(self, user_id: int, limit: int = 5) -> list[JobRecord]:
+        """Get recent jobs for a user."""
+        with self._lock, self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT video_id, user_id, channel_id, status, progress, estimated_time_sec,
+                       started_at, completed_at, created_at
+                FROM jobs
+                WHERE user_id=?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+
+            return [
+                JobRecord(
+                    video_id=row["video_id"],
+                    user_id=row["user_id"],
+                    channel_id=row["channel_id"],
+                    status=row["status"],
+                    progress=row["progress"],
+                    estimated_time_sec=row["estimated_time_sec"],
+                    started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+                    completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+                    created_at=datetime.fromisoformat(row["created_at"]) if isinstance(row["created_at"], str) else row["created_at"],
+                )
+                for row in rows
+            ]
+
+    def cleanup_old_jobs(self, days: int = 7) -> None:
+        """Clean up job records older than N days."""
+        with self._lock, self._get_conn() as conn:
+            cutoff = datetime.utcnow().timestamp() - (days * 86400)
+            conn.execute(
+                """
+                DELETE FROM jobs
+                WHERE created_at < datetime(?, 'unixepoch')
+                """,
+                (cutoff,),
+            )
 

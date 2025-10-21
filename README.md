@@ -4,24 +4,46 @@ A production-ready Discord bot that turns any YouTube video into a structured, a
 
 ## Features
 
-- `/summarize` slash command accepts a YouTube URL or video ID.
+### Core Functionality
+- `/summarize` slash command accepts a YouTube URL or video ID
+- `/status` command to check current queue status (short and long queues)
+- `/myjobs` command to view your recent summarization jobs and their progress
 - Transcript acquisition pipeline (captions-only, no audio download):
   1. Direct subtitle extraction via [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) (primary method)
   2. YouTube captions via [`youtube-transcript-api`](https://pypi.org/project/youtube-transcript-api/) (manual → auto-generated → translated) - currently disabled due to XML parsing issues
-- **Timestamp preservation**: Transcripts maintain VTT timestamps in `[MM:SS]` format for quote attribution.
+- **Timestamp preservation**: Transcripts maintain VTT timestamps in `[MM:SS]` format for quote attribution
 - Structured Markdown summaries with:
   - **TL;DW** — 2-3 sentence overview
-  - **Key Points** — bulleted list of important insights
-  - **Notable Quotes** — memorable quotes with timestamps in `[MM:SS]` format
+  - **Key Points** — comprehensive bulleted list (10-15 bullets) of important insights with quotes
   - **Caveats & Limitations** — uncertainties or missing context
-- **Adaptive summarization strategy**:
+
+### Long Video Support (NEW)
+- **Two-tier queue system**:
+  - Short queue (≤10 minutes) - Uses Discord interaction responses
+  - Long queue (>10 minutes) - Uses webhooks and channel messages to bypass Discord's 15-minute interaction limit
+- **Webhook-based responses**: Long-running jobs send updates via Discord webhooks, avoiding interaction token expiration
+- **Job tracking system**: All long videos are tracked in SQLite with status updates (queued → processing → completed/failed)
+- **Graceful degradation**: Automatic fallback to channel messages if interaction tokens expire
+- **User confirmation**: Long videos require user confirmation before processing
+
+### Summarization Strategy
+- **Adaptive processing**:
   - One-shot summarization for short videos (fits in context window)
   - Hierarchical map-reduce for long videos with streaming chunk processing
-- Advanced rate limiting and quota management to prevent YouTube API abuse.
-- Persistent SQLite caching for transcripts and summaries with configurable TTL.
-- Circuit breaker pattern for handling YouTube 429 rate limits.
-- Discord-safe message splitting with automatic `.txt` attachments for long outputs.
-- Docker-ready deployment with ffmpeg and all dependencies.
+  - Dynamic token allocation based on context window size
+- **Performance optimizations**:
+  - Streaming chunk processing to avoid memory issues
+  - Parallel LLM calls with configurable concurrency (default: 3)
+  - Efficient hierarchical merging (6-10 summaries per merge group)
+  - Adaptive time estimation based on historical performance data
+
+### Protection & Reliability
+- Advanced rate limiting and quota management to prevent YouTube API abuse
+- Persistent SQLite caching for transcripts and summaries with configurable TTL
+- Circuit breaker pattern for handling YouTube 429 rate limits
+- Per-user and per-channel quotas to prevent abuse
+- Negative caching with per-video cooldowns after rate limits
+- Docker-ready deployment with ffmpeg and all dependencies
 
 ## Project Layout
 
@@ -73,6 +95,12 @@ cp .env.example .env
 | `SUMMARY_CHAR_BUDGET` | Max summary character budget (default `3500`) |
 | `SUMMARY_MAX_TOKENS` | Max tokens for summary generation (default `1100`) |
 | `LLM_CONCURRENCY` | Concurrent LLM calls during chunking (default `3`) |
+| **Queue Management** | |
+| `SHORT_QUEUE_LIMIT` | Max concurrent short video jobs (default `3`) |
+| `LONG_QUEUE_LIMIT` | Max concurrent long video jobs (default `1`) |
+| `MAX_PROCESSING_SECONDS` | Threshold for short vs long queue (default `600` = 10 min) |
+| `TOKENS_PER_SECOND` | LLM throughput for time estimation (default `30`) |
+| `API_OVERHEAD_SEC` | API call overhead for estimation (default `2.0`) |
 | **Caching** | |
 | `CACHE_DB` | SQLite database path for legacy storage (default `cache.sqlite3`) |
 | `CACHE_DB_PATH` | Persistent transcript cache path (default `/app/cache.db`) |
@@ -155,6 +183,8 @@ docker run \
 
 - **transcripts**: `video_id`, `source`, `text`, `created_at`
 - **summaries**: `video_id`, `prompt_hash`, `model`, `summary`, `created_at`
+- **performance_metrics**: `video_id`, `transcript_tokens`, `num_chunks`, `processing_time_seconds`, `strategy`, `created_at`
+- **jobs**: `video_id`, `user_id`, `channel_id`, `status`, `progress`, `estimated_time_sec`, `started_at`, `completed_at`, `created_at`
 
 ## Performance Features
 
@@ -172,14 +202,44 @@ docker run \
 - **Negative caching**: Per-video cooldown after rate limit errors
 - **Stable jitter**: Deterministic jitter based on video ID to spread out requests
 
+## Discord Commands
+
+- `/summarize <url>` - Summarize a YouTube video by URL or video ID
+- `/status` - Check the current queue status (short and long queues)
+- `/myjobs` - View your recent summarization jobs and their status
+
+## How Long Videos Work
+
+1. **Estimation**: Bot estimates processing time based on transcript length and historical performance
+2. **Queue Selection**:
+   - Videos ≤10 minutes → Short queue (interaction-based responses)
+   - Videos >10 minutes → Long queue (webhook/channel-based responses)
+3. **User Confirmation**: Long videos require user confirmation before processing
+4. **Webhook Creation**: Bot creates or reuses a webhook named `tldwbot-processor` for long-lived communication
+5. **Job Tracking**: Long videos are tracked in the `jobs` table with real-time status updates
+6. **Graceful Handling**: If interaction tokens expire, the bot automatically falls back to channel messages
+
 ## Notes
 
-- The bot **only** fetches YouTube captions; it does not download audio or use Whisper transcription.
-- If a video has no captions, the bot will return an error message: "No captions available for this video."
-- The bot automatically labels the transcript source in responses (e.g., `cache:yt-dlp`, `yt-dlp`).
-- **Timestamps are preserved** from VTT captions and included in notable quotes as `[MM:SS]` format.
-- Large summaries are attached as `.txt` files for convenience.
-- Rate limiting and quotas prevent YouTube API abuse (all configurable via environment variables).
-- Ensure your Discord bot has the `Message Content Intent` if you plan to extend functionality beyond slash commands.
-- See `CLAUDE.md` for development guardrails and best practices.
+- The bot **only** fetches YouTube captions; it does not download audio or use Whisper transcription
+- If a video has no captions, the bot will return an error message: "No captions available for this video"
+- The bot automatically labels the transcript source in responses (e.g., `cache:yt-dlp`, `yt-dlp`)
+- **Timestamps are preserved** from VTT captions and included in key points with quotes as `[MM:SS]` format
+- **Discord interaction token limit**: Discord interaction tokens expire after 15 minutes. The bot handles this automatically for long videos using webhooks and channel messages
+- Long video processing can take 30+ minutes for very long transcripts (>150K tokens). Use `/myjobs` to check progress
+- Rate limiting and quotas prevent YouTube API abuse (all configurable via environment variables)
+- Ensure your Discord bot has the `Message Content Intent` if you plan to extend functionality beyond slash commands
+- See `CLAUDE.md` for development guardrails and best practices
+
+## Recent Changes
+
+### v2.0 - Long Video Support & Job Tracking (2025-01-21)
+- Added webhook-based responses to bypass Discord's 15-minute interaction token limit
+- Implemented two-tier queue system (short/long) with separate concurrency limits
+- Added job tracking system with `/myjobs` command for monitoring progress
+- Added `/status` command for global queue visibility
+- Improved error handling with automatic fallback to channel messages
+- Enhanced time estimation using historical performance data
+- Fixed MERGE_TOKENS calculation bug for small context windows
+- Improved hierarchical merging efficiency (group_size 6-10 vs 1)
 
