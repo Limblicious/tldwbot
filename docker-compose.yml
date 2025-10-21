@@ -8,6 +8,8 @@ services:
       - .:/app
       - ./data:/app/data
     network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     # Uncomment the following to enable GPU passthrough for local Whisper acceleration
     # Requires NVIDIA Container Toolkit: https://github.com/NVIDIA/nvidia-container-toolkit

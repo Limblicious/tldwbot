@@ -50,7 +50,7 @@ README.md
 
 - Python 3.11+
 - Discord bot token with the `applications.commands` scope enabled
-- OpenAI API key with access to `gpt-4.1-mini` (for summarization only)
+- Local LLM server (e.g., llama.cpp, vLLM, or OpenAI-compatible endpoint) running DeepSeek-R1-Distill-Qwen-7B or similar model
 
 ## Configuration
 
@@ -64,9 +64,10 @@ cp .env.example .env
 | --- | --- |
 | **Required** | |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
-| `OPENAI_API_KEY` | OpenAI API key for summarization |
+| `OPENAI_API_KEY` | API key for LLM endpoint (use `local` for local servers) |
+| `OPENAI_BASE_URL` | Base URL for OpenAI-compatible API endpoint |
 | **Summarization** | |
-| `OPENAI_SUMMARY_MODEL` | Chat model for summarization (default `gpt-4o-mini`) |
+| `OPENAI_SUMMARY_MODEL` | Model name or path (e.g., DeepSeek-R1-Distill-Qwen-7B) |
 | `ONE_SHOT_ENABLED` | Enable one-shot summarization for short videos (default `1`) |
 | `CONTEXT_TOKENS` | LLM context window size (default `128000`) |
 | `SUMMARY_CHAR_BUDGET` | Max summary character budget (default `3500`) |

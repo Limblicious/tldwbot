@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -13,16 +14,26 @@ from openai import OpenAI
 from bot.tokens import count_tokens
 from bot.stream_split import stream_split
 
+logger = logging.getLogger("tldwbot")
+
 # Configuration from environment
 ONE_SHOT_ENABLED = os.getenv("ONE_SHOT_ENABLED", "1") in ("1", "true", "True")
-CONTEXT_TOKENS = int(os.getenv("CONTEXT_TOKENS", "128000"))  # gpt-4o-mini context
+CONTEXT_TOKENS = int(os.getenv("CONTEXT_TOKENS", "128000"))  # Model context window
 PROMPT_TOKENS = int(os.getenv("PROMPT_TOKENS", "2500"))
 OUTPUT_TOKENS = int(os.getenv("OUTPUT_TOKENS", "2000"))
 SAFETY_TOKENS = int(os.getenv("SAFETY_TOKENS", "1000"))
 BUDGET = CONTEXT_TOKENS - PROMPT_TOKENS - OUTPUT_TOKENS - SAFETY_TOKENS
 
-MICRO_TOKENS = min(4096, BUDGET // 4)  # First pass chunk size
-MERGE_TOKENS = min(12000, BUDGET - 5000)  # Merge pass budget
+# For small context windows (e.g., 4096), use simpler allocation
+if CONTEXT_TOKENS <= 8192:
+    # Small context: use ~50% for chunks, ~30% for merging
+    MICRO_TOKENS = max(512, int(CONTEXT_TOKENS * 0.5))
+    MERGE_TOKENS = max(1000, int(CONTEXT_TOKENS * 0.3))
+else:
+    # Large context: use original formula
+    MICRO_TOKENS = min(4096, BUDGET // 4)
+    MERGE_TOKENS = min(12000, max(1000, BUDGET - 5000))  # Ensure minimum 1000 tokens
+
 CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "3"))
 PER_CALL_TIMEOUT = int(os.getenv("PER_CALL_TIMEOUT_SEC", "60"))
 MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
@@ -31,6 +42,7 @@ MAX_TOTAL_RUNTIME_SEC = int(os.getenv("MAX_TOTAL_RUNTIME_SEC", "1800"))
 # Hard size caps so one embed always fits
 SUMMARY_CHAR_BUDGET = int(os.getenv("SUMMARY_CHAR_BUDGET", "3500"))  # final text budget
 SUMMARY_MAX_TOKENS = int(os.getenv("SUMMARY_MAX_TOKENS", "1100"))  # ~4 chars/token ≈ 4400 chars
+MAX_GENERATED_TOKENS = int(os.getenv("SUMMARY_MAX_TOKENS", "600"))
 
 DEFAULT_PROMPT = """
 You are an expert analyst producing concise yet information-rich video summaries.
@@ -85,20 +97,30 @@ async def call_openai_with_retry(
     max_tokens: Optional[int] = None
 ) -> str:
     """Call OpenAI API with timeout and exponential backoff retry."""
+    # Use MAX_GENERATED_TOKENS if max_tokens not explicitly provided
+    if max_tokens is None:
+        max_tokens = MAX_GENERATED_TOKENS
+
     for attempt in range(max_retries + 1):
         try:
+            payload = dict(
+                model=model,
+                messages=[
+                    {"role": "system",
+                     "content": "You are a helpful assistant. Write concise answers only. "
+                                "Do NOT include chain-of-thought or hidden reasoning."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=max_tokens,
+            )
+
             if tl:
                 with tl.span("openai_api_call", attempt=attempt):
                     response = await asyncio.wait_for(
                         asyncio.to_thread(
                             client.chat.completions.create,
-                            model=model,
-                            messages=[
-                                {"role": "system", "content": "You are a helpful assistant that strictly follows formatting instructions."},
-                                {"role": "user", "content": prompt},
-                            ],
-                            temperature=0.2,
-                            max_tokens=max_tokens,
+                            **payload
                         ),
                         timeout=timeout
                     )
@@ -106,13 +128,7 @@ async def call_openai_with_retry(
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         client.chat.completions.create,
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": "You are a helpful assistant that strictly follows formatting instructions."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.2,
-                        max_tokens=max_tokens,
+                        **payload
                     ),
                     timeout=timeout
                 )
@@ -126,6 +142,14 @@ async def call_openai_with_retry(
             raise RuntimeError(f"OpenAI API call timed out after {max_retries + 1} attempts")
 
         except Exception as e:
+            # Check if it's a context size error - don't retry, fail fast
+            error_str = str(e).lower()
+            if "context" in error_str and ("exceed" in error_str or "size" in error_str):
+                raise RuntimeError(
+                    f"Transcript exceeds model context window. "
+                    f"This should have been caught earlier - please report this bug."
+                ) from e
+
             if attempt < max_retries:
                 wait = (2 ** attempt) + (time.time() % 1)
                 await asyncio.sleep(wait)
@@ -202,18 +226,21 @@ async def hierarchical_summarize(
     4. Final merge to produce structured output
     """
     start_time = time.time()
+    logger.info("Starting hierarchical summarization (max runtime: %ds)", MAX_TOTAL_RUNTIME_SEC)
 
     # Phase 1: Map - summarize micro chunks lazily
     semaphore = asyncio.Semaphore(CONCURRENCY)
     partials: List[ChunkSummary] = []
     tasks = []
     chunk_index = 0
+    last_log_time = start_time
 
     async def summarize_with_limit(idx, chunk):
         async with semaphore:
             if progress_callback:
                 await progress_callback(f"Processing chunk {idx + 1}")
-            return await summarize_chunk_async(
+            chunk_start = time.time()
+            result = await summarize_chunk_async(
                 chunk,
                 chunk_index=idx,
                 total_chunks=-1,  # Unknown until streaming completes
@@ -221,6 +248,9 @@ async def hierarchical_summarize(
                 model=model,
                 tl=tl
             )
+            chunk_elapsed = time.time() - chunk_start
+            logger.debug("Chunk %d processed in %.2fs", idx + 1, chunk_elapsed)
+            return result
 
     # Stream chunks and process them on-the-fly without materializing full list
     for chunk in stream_split(transcript, model, MICRO_TOKENS, overlap_tokens=128):
@@ -238,6 +268,14 @@ async def hierarchical_summarize(
             partials.extend(batch_results)
             tasks.clear()
 
+            # Log progress every 30 seconds
+            now = time.time()
+            if now - last_log_time >= 30:
+                elapsed = now - start_time
+                logger.info("Phase 1 progress: %d chunks processed in %.1fs (%.1f chunks/min)",
+                           len(partials), elapsed, len(partials) / (elapsed / 60))
+                last_log_time = now
+
     # Process remaining tasks
     if tasks:
         batch_results = await asyncio.gather(*tasks)
@@ -247,23 +285,36 @@ async def hierarchical_summarize(
     if tl:
         tl.set_metadata("total_chunks_pass1", total_chunks)
 
+    phase1_elapsed = time.time() - start_time
+    logger.info("Phase 1 complete: %d chunks processed in %.1fs (avg %.2fs/chunk)",
+               total_chunks, phase1_elapsed, phase1_elapsed / total_chunks if total_chunks > 0 else 0)
+
     # Check runtime
     elapsed = time.time() - start_time
     if elapsed > MAX_TOTAL_RUNTIME_SEC:
+        logger.warning("Timeout reached after Phase 1 (%.1fs > %ds), returning partial summary",
+                      elapsed, MAX_TOTAL_RUNTIME_SEC)
         # Return best-effort merge
         return await merge_summaries_async(partials[:10], client=client, model=model, is_final=True, tl=tl) + \
                "\n\n*(Partial summary due to time limit)*"
 
     # Phase 2: Reduce hierarchically
+    logger.info("Starting Phase 2: Hierarchical reduction")
     current_level = partials
     level = 0
 
     while len(current_level) > 1:
         level += 1
+        level_start = time.time()
         # Group summaries that fit in MERGE_TOKENS
-        # Estimate ~500 tokens per summary, group accordingly
-        group_size = max(1, MERGE_TOKENS // 1000)
+        # Estimate ~200 tokens per summary (compact bullets), group accordingly
+        # Use more aggressive grouping: aim for 6-10 summaries per merge
+        estimated_tokens_per_summary = 200
+        group_size = max(6, min(10, MERGE_TOKENS // estimated_tokens_per_summary))
         groups = [current_level[i:i+group_size] for i in range(0, len(current_level), group_size)]
+
+        logger.info("Phase 2 Level %d: merging %d summaries into %d groups (group_size=%d)",
+                   level, len(current_level), len(groups), group_size)
 
         if tl:
             tl.set_metadata(f"reduce_level_{level}_groups", len(groups))
@@ -273,6 +324,7 @@ async def hierarchical_summarize(
 
         async def merge_group(group_idx, group):
             async with semaphore:
+                merge_start = time.time()
                 merged_text = await merge_summaries_async(
                     group,
                     client=client,
@@ -280,6 +332,8 @@ async def hierarchical_summarize(
                     is_final=(len(groups) == 1),
                     tl=tl
                 )
+                merge_elapsed = time.time() - merge_start
+                logger.debug("Level %d Group %d merged in %.2fs", level, group_idx + 1, merge_elapsed)
                 return ChunkSummary(index=group_idx, text=merged_text)
 
         if tl:
@@ -290,14 +344,50 @@ async def hierarchical_summarize(
             tasks = [merge_group(i, g) for i, g in enumerate(groups)]
             current_level = await asyncio.gather(*tasks)
 
+        level_elapsed = time.time() - level_start
+        logger.info("Phase 2 Level %d complete: %d groups merged in %.1fs (avg %.2fs/group)",
+                   level, len(groups), level_elapsed, level_elapsed / len(groups) if len(groups) > 0 else 0)
+
         # Check runtime again
         elapsed = time.time() - start_time
         if elapsed > MAX_TOTAL_RUNTIME_SEC:
+            logger.warning("Timeout reached at Phase 2 Level %d (%.1fs > %ds), returning partial summary",
+                          level, elapsed, MAX_TOTAL_RUNTIME_SEC)
             result = current_level[0].text if current_level else "*(Processing interrupted)*"
             return result + "\n\n*(Partial summary due to time limit)*"
 
     # Final result
+    total_elapsed = time.time() - start_time
+    logger.info("Hierarchical summarization complete in %.1fs (%.1f minutes)",
+               total_elapsed, total_elapsed / 60)
     return current_level[0].text if current_level else ""
+
+
+def calculate_dynamic_output_tokens(transcript_tokens: int, context_window: int, prompt_overhead: int = 500) -> int:
+    """
+    Dynamically calculate max output tokens to maximize context usage.
+
+    Formula: max_output = context_window - transcript_tokens - prompt_overhead
+
+    Args:
+        transcript_tokens: Number of tokens in the transcript
+        context_window: Model's total context window (e.g., 4096)
+        prompt_overhead: Estimated tokens for prompts, system messages, formatting (default: 500)
+
+    Returns:
+        Maximum output tokens that fits within context window
+    """
+    # Calculate available space
+    available = context_window - transcript_tokens - prompt_overhead
+
+    # Ensure minimum viable output (at least 300 tokens for a summary)
+    min_output = 300
+
+    # Cap at reasonable maximum (no need for summaries > 1200 tokens)
+    max_output = 1200
+
+    # Return constrained value
+    return max(min_output, min(available, max_output))
 
 
 async def summarize_transcript_async(
@@ -330,8 +420,19 @@ async def summarize_transcript_async(
     if tl:
         tl.set_metadata("transcript_tokens", transcript_tokens)
 
+    # Dynamic one-shot threshold: can we fit transcript + prompt + output in context?
+    # Use generous check: transcript + 500 (prompt) + 300 (min output) < CONTEXT_TOKENS
+    one_shot_threshold = CONTEXT_TOKENS - 800  # 4096 - 800 = 3296 tokens max transcript for one-shot
+
     # Strategy 1: One-shot if it fits
-    if ONE_SHOT_ENABLED and transcript_tokens <= BUDGET:
+    if ONE_SHOT_ENABLED and transcript_tokens <= one_shot_threshold:
+        # Dynamically calculate optimal output tokens
+        dynamic_max_tokens = calculate_dynamic_output_tokens(
+            transcript_tokens=transcript_tokens,
+            context_window=CONTEXT_TOKENS,
+            prompt_overhead=500
+        )
+
         one_shot_prompt = (
             f"{DEFAULT_PROMPT}\n\n"
             f"HARD OUTPUT LIMIT: Respond in <= {SUMMARY_CHAR_BUDGET} characters total. "
@@ -342,9 +443,9 @@ async def summarize_transcript_async(
         )
         if tl:
             with tl.span("one_shot_summarize"):
-                result = await call_openai_with_retry(one_shot_prompt, client, model, tl=tl, max_tokens=SUMMARY_MAX_TOKENS)
+                result = await call_openai_with_retry(one_shot_prompt, client, model, tl=tl, max_tokens=dynamic_max_tokens)
         else:
-            result = await call_openai_with_retry(one_shot_prompt, client, model, tl=tl, max_tokens=SUMMARY_MAX_TOKENS)
+            result = await call_openai_with_retry(one_shot_prompt, client, model, tl=tl, max_tokens=dynamic_max_tokens)
         return _enforce_char_budget(result, SUMMARY_CHAR_BUDGET)
 
     # Strategy 2: Hierarchical map-reduce
